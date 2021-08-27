@@ -1,0 +1,56 @@
+version: '3.9'
+services:
+  scheduler:
+    env_file: .env
+    image: "registry.gitlab.com/trivialsec/scheduler/${BUILD_ENV}:${IMAGE_TAG:-latest}"
+    container_name: scheduler
+    build:
+      context: ./
+      dockerfile: Dockerfile
+      args:
+        BUILD_ENV: ${BUILD_ENV}
+    environment:
+      - COMMON_VERSION=${COMMON_VERSION}
+      - APP_ENV=${APP_ENV:-Dev}
+      - APP_NAME=${APP_NAME}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+    volumes:
+      - ./src:/srv/app/src
+      - cache:/var/cache/trivialsec
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+      - NET_BIND_SERVICE
+    networks:
+      default:
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 0s
+        max_attempts: 10
+        window: 3s
+      resources:
+        limits:
+          cpus: '1.00'
+          memory: 1GB
+        reservations:
+          cpus: '0.50'
+          memory: 500M
+
+networks:
+  default:
+    external:
+      name: trivialsec
+
+volumes:
+  cache:
+    external: true
+    name: scheduler-cache

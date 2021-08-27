@@ -1,0 +1,30 @@
+{
+    "cSpell.words": [
+        "Gitlab",
+        "INET",
+        "boto",
+        "botocore",
+        "chdir",
+        "cvss",
+        "dateutil",
+        "errno",
+        "getenv",
+        "gethostbyname",
+        "grecaptcha",
+        "gunicorn",
+        "hmac",
+        "initialising",
+        "jsonify",
+        "normalise",
+        "nvdcve",
+        "opensll",
+        "organisation",
+        "phishtank",
+        "pylint",
+        "recaptcha",
+        "socketio",
+        "stylesheet",
+        "trivialsec",
+        "tzlocal"
+    ]
+}

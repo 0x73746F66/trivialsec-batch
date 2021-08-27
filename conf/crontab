@@ -1,0 +1,1 @@
+* * * * * /usr/bin/python3 /srv/app/src/load_nvd_cve.py >> /var/log/trivialsec/load_nvd_cve.log 2>&1
