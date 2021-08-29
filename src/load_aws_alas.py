@@ -155,14 +155,6 @@ def save_alas(data :dict):
         cve_remediation.persist()
 
 def main(not_before :datetime):
-    print('not_before')
-    print(not_before)
-    not_before_utc = not_before.replace(tzinfo=pytz.UTC)
-    print('not_before_utc')
-    print(not_before_utc)
-    not_before_local = pytz.utc.localize(not_before)
-    print('not_before_local')
-    print(not_before_local)
     for feed_file, feed_url in FEEDS.items():
         channel = download_xml_file(feed_url, feed_file)
         if not isinstance(channel, Element):
@@ -176,8 +168,6 @@ def main(not_before :datetime):
             if html_content:
                 data = {**data, **html_to_dict(html_content)}
             save_alas(data)
-            break
-        break
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
