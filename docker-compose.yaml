@@ -41,10 +41,10 @@ services:
       resources:
         limits:
           cpus: '1.00'
-          memory: 1GB
+          memory: 2GB
         reservations:
           cpus: '0.50'
-          memory: 500M
+          memory: 1GB
 
 networks:
   default:

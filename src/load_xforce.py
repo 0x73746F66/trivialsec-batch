@@ -253,7 +253,7 @@ def do_latest(limit :int = 200):
         xforce_file = pathlib.Path(datafile_path)
         if xforce_file.is_file():
             original_data = json.loads(xforce_file.read_text())
-            original_data |= item
+            original_data = {**original_data, **item}
             original_data['cvss_vector'] = xforce_cvss_vector(original_data)
             logger.info(f'UPDATE {datafile_path}')
             xforce_file.write_text(json.dumps(original_data, default=str, sort_keys=True))
@@ -292,7 +292,7 @@ def do_bulk(start :datetime, end :datetime) -> bool:
         if xforce_file.is_file():
             logger.debug(datafile)
             original_data = json.loads(xforce_file.read_text())
-            original_data |= item
+            original_data = {**original_data, **item}
             original_data['cvss_vector'] = xforce_cvss_vector(original_data)
             xforce_file.write_text(json.dumps(original_data, default=str, sort_keys=True))
             process_file(datafile)
@@ -310,7 +310,7 @@ def read_file(file_path :str):
         return None
     item = json.loads(xforce_file.read_text())
     original_data = json.loads(xforce_file.read_text())
-    original_data |= item
+    original_data = {**original_data, **item}
     original_data['cvss_vector'] = xforce_cvss_vector(original_data)
     xforce_json = json.dumps(original_data, default=str, sort_keys=True)
     xforce_file.write_text(xforce_json)

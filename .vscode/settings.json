@@ -21,6 +21,7 @@
         "organisation",
         "phishtank",
         "pylint",
+        "pytz",
         "recaptcha",
         "socketio",
         "stylesheet",

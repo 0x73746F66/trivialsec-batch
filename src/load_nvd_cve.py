@@ -112,7 +112,7 @@ def normalise_cve_item(item :dict) -> CVE:
     cve.published_at = datetime.fromisoformat(item['publishedDate'].replace('T', ' ').replace('Z', ''))
     cve.last_modified = datetime.fromisoformat(item['lastModifiedDate'].replace('T', ' ').replace('Z', ''))
 
-    cpes = set(original_cve.cpe)
+    cpes = set(original_cve.cpe or [])
     for configuration_node in item['configurations']['nodes']:
         for cpe_match in configuration_node['cpe_match']:
             cpes.add(cpe_match.get('cpe23Uri'))

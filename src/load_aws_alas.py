@@ -10,7 +10,6 @@ from requests.exceptions import ConnectTimeout, ReadTimeout
 from retry.api import retry
 from bs4 import BeautifulSoup as bs
 from trivialsec.models.cve import CVE
-from trivialsec.models.cve_remediation import CVERemediation
 from trivialsec.helpers.config import config
 
 
@@ -31,7 +30,7 @@ USER_AGENT = 'trivialsec.com'
 BASE_URL = 'https://alas.aws.amazon.com/'
 DATAFILE_DIR = '/var/cache/trivialsec/'
 ALAS_PATTERN = r"(ALAS\-\d{4}\-\d*)"
-ISO_FMT = "%Y-%m-%dT%H:%MZ"
+AMZ_DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2011
 FEEDS = {
     f'{DATAFILE_DIR}amzl1.xml': f'{BASE_URL}alas.rss',
@@ -111,6 +110,7 @@ def save_alas(data :dict):
     for cve_ref in data.get('cve_refs', []):
         if cve_ref == 'CVE-PENDING':
             continue
+        save = False
         cve = CVE()
         cve.cve_id = cve_ref
         original_cve = CVE()
@@ -122,37 +122,42 @@ def save_alas(data :dict):
             cve.description = f'{source}\n{data.get("issue_overview", "")}'.strip()
             cve.published_at = datetime.strptime(data['pubDate'], AMZ_DATE_FORMAT).replace(tzinfo=pytz.UTC)
             cve.last_modified = datetime.strptime(data['lastBuildDate'], AMZ_DATE_FORMAT).replace(tzinfo=pytz.UTC)
+            save = True
 
         reference_urls = set()
-        for ref in original_cve.references:
+        for ref in original_cve.references or []:
             reference_urls.add(ref['url'])
+        remediation_sources = set()
+        for remediation in original_cve.remediation or []:
+            remediation_sources.add(remediation['source_url'])
 
+        cve.references = original_cve.references or []
         if data['link'] not in reference_urls:
-            original_cve.references.append({
+            cve.references.append({
                 'url': data['link'],
                 'name': data['vendor_id'],
                 'source': source,
                 'tags': data.get('affected_packages'),
             })
-        cve.references = original_cve.references
-        extra = None
-        doc = cve.get_doc()
-        if doc is not None:
-            extra = doc.get('_source', {}).get('_nvd')
-        if len(cve.references) > len(original_cve.references):
-            cve.persist(extra=extra)
+            save = True
+        cve.remediation = original_cve.remediation or []
+        if data['link'] not in remediation_sources:
+            cve.remediation.append({
+                'type': 'patch',
+                'source': source,
+                'source_id': data.get('vendor_id', data['link'].split('/')[-1]),
+                'source_url': data['link'],
+                'description': f"{data.get('issue_correction', '')}\n\n{data.get('new_packages', '')}".strip(),
+                'published_at': datetime.strptime(data['lastBuildDate'], AMZ_DATE_FORMAT).replace(tzinfo=pytz.UTC),
+            })
+            save = True
 
-        cve_remediation = CVERemediation()
-        cve_remediation.cve_id = cve_ref
-        if cve_remediation.exists():
-            continue
-        cve_remediation.type = 'patch'
-        cve_remediation.source = source
-        cve_remediation.source_id = data['vendor_id']
-        cve_remediation.source_url = data['link']
-        cve_remediation.description = f"{data.get('issue_correction', '')}\n\n{data.get('new_packages', '')}".strip()
-        cve_remediation.published_at = datetime.strptime(data['lastBuildDate'], AMZ_DATE_FORMAT).replace(tzinfo=pytz.UTC)
-        cve_remediation.persist()
+        if save is True:
+            extra = None
+            doc = cve.get_doc()
+            if doc is not None:
+                extra = {'_nvd': doc.get('_source', {}).get('_nvd')}
+            cve.persist(extra=extra)
 
 def main(not_before :datetime):
     for feed_file, feed_url in FEEDS.items():
@@ -176,6 +181,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     not_before = datetime(year=int(args.year), month=1 , day=1)
     if args.not_before is not None:
-        not_before = datetime.strptime(args.not_before, ISO_FMT)
+        not_before = datetime.strptime(args.not_before, AMZ_DATE_FMT)
 
     main(not_before)

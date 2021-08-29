@@ -1,17 +1,15 @@
-import json
 import logging
 import pathlib
-from datetime import datetime, timedelta
+import argparse
 import os
 import xml
+from datetime import datetime, timedelta
 from xml.etree.ElementTree import Element, ElementTree
 import requests
 from requests.exceptions import ConnectTimeout, ReadTimeout
 from retry.api import retry
 from trivialsec.helpers.config import config
-from trivialsec.models.cve_reference import CVEReference
-from trivialsec.models.cve_remediation import CVERemediation
-from trivialsec.models.cve_cpe import CPE
+from trivialsec.models.cve import CVE
 
 
 logger = logging.getLogger(__name__)
@@ -21,15 +19,19 @@ logging.basicConfig(
 )
 session = requests.Session()
 OVAL_SCHEMA_VERSION = '5.11.2'
-DATAFILE_DIR = 'datafiles/oval'
+DATAFILE_DIR = '/var/cache/trivialsec'
 CVE_PATTERN = r"(CVE\-\d{4}\-\d*)"
+DATE_FMT = "%Y-%m-%dT%H:%M:%S"
+DEFAULT_START_YEAR = 2005
 PROXIES = None
 if config.http_proxy or config.https_proxy:
     PROXIES = {
         'http': f'http://{config.http_proxy}',
         'https': f'https://{config.https_proxy}'
     }
-""" https://github.com/CISecurity/OVALRepo/blob/master/scripts/lib_oval.py
+
+"""
+https://github.com/CISecurity/OVALRepo/blob/master/scripts/lib_oval.py
 :Usage:
 
 1. Create an OvalDocument:
@@ -1156,6 +1158,7 @@ def local_oval(local_file :str):
     return OvalDocument(stored_tree)
 
 def remote_oval(url :str, local_file :str) -> OvalDocument:
+    logger.info(url)
     raw = query_raw(url)
     oval_file = pathlib.Path(local_file)
     oval_file.write_text(raw)
@@ -1176,56 +1179,88 @@ def cpe_from_definitions(document :OvalDocument, definitions :list):
 
 def save_definition(definition :dict):
     for cve_id in definition.get('cve', []):
-        for vendor in definition['vendors']:
-            try:
-                remediation = CVERemediation()
-                remediation.cve_id = cve_id
-                remediation.type = 'patch'
-                remediation.source = definition.get('oval_id')
-                remediation.source_id = vendor.get('ref_id')
-                remediation.source_url = vendor.get('ref_url')
-                remediation.description = definition.get('description')
-                remediation.published_at = definition.get('submitted_at').replace('T', ' ')
-                remediation.persist()
-                if 'cve.mitre.org' in vendor.get('ref_url'):
-                    continue
-                cve_reference = CVEReference()
-                cve_reference.cve_id = cve_id
-                cve_reference.url = vendor.get('ref_url')
-                cve_reference.name = vendor.get('ref_id')
-                cve_reference.source = definition.get('oval_id')
-                cve_reference.tags = ','.join(set([item for sublist in definition.get('contributors') for item in sublist]))
-                cve_reference.persist()
+        cve = CVE()
+        cve.cve_id = cve_id
+        original_cve = CVE()
+        save = False
+        if cve.hydrate():
+            original_cve = cve
+        else:
+            cve.assigner = 'Unknown'
+            cve.description = definition.get('description')
+            cve.published_at = datetime.fromisoformat(definition.get('submitted_at'))
+            cve.last_modified = datetime.utcnow()
+            save = True
 
-            except Exception as ex:
-                logger.exception(ex)
-                logger.error(json.dumps(definition, default=str))
-                exit(0)
+        if cve.title is None:
+            cve.title = definition.get('title')
+            save = True
+
+        cpes = set(original_cve.cpe or [])
+        reference_urls = set()
+        for ref in original_cve.references or []:
+            reference_urls.add(ref['url'])
+        cve.references = original_cve.references or []
+        remediation_sources = set()
+        for remediation in original_cve.remediation or []:
+            remediation_sources.add(remediation['source_url'])
+
+        for vendor in definition['vendors']:
+            if vendor.get('ref_url') is None:
+                continue
+            if vendor.get('ref_url') not in remediation_sources:
+                cve.remediation.append({
+                    'type': 'patch',
+                    'source': definition.get('oval_id'),
+                    'source_id': vendor.get('ref_id'),
+                    'source_url': vendor.get('ref_url'),
+                    'description': definition.get('description'),
+                    'published_at': datetime.fromisoformat(definition.get('submitted_at')),
+                })
+                save = True
+
+            if 'cve.mitre.org' in vendor.get('ref_url'):
+                continue
+            if vendor.get('ref_url') not in reference_urls:
+                cve.references.append({
+                    'url': vendor.get('ref_url'),
+                    'name': vendor.get('ref_id'),
+                    'source': definition.get('oval_id'),
+                    'tags': ','.join(set([item for sublist in definition.get('contributors') for item in sublist])),
+                })
+                save = True
 
         for cpe_ref in definition['cpe_refs']:
-            CPE(
-                cve_id=cve_id,
-                cpe=cpe_ref,
-            ).persist()
+            if cpe_ref not in cpes:
+                cpes.add(cpe_ref)
+                save = True
 
-def main(sources :list):
+        cve.cpe = list(cpes)
+        if save is True:
+            extra = None
+            doc = cve.get_doc()
+            if doc is not None:
+                extra = {'_nvd': doc.get('_source', {}).get('_nvd')}
+            cve.persist(extra=extra)
+
+def main(sources :list, not_before :datetime):
     for source_file, sources_url in sources:
         filename = f"{DATAFILE_DIR}/{source_file}"
         stored_document = local_oval(filename)
-        stored_generator = stored_document.getGenerator()
-        stored_cis_ts = datetime.fromisoformat(stored_generator.getTimestamp().replace('T', ' '))
-        day_ago = datetime.utcnow() - timedelta(days=1)
-        process = False
+        process = stored_document is None
         document = None
-        if OVAL_SCHEMA_VERSION != stored_generator.getSchemaVersion():
-            process = True
-        if stored_cis_ts < day_ago:
-            document = remote_oval(sources_url, filename)
-            generator = document.getGenerator()
-            cis_data_ts = datetime.fromisoformat(generator.getTimestamp().replace('T', ' '))
-            if cis_data_ts > stored_cis_ts:
-                process = True
+        if stored_document is not None:
+            stored_generator = stored_document.getGenerator()
+            stored_cis_ts = datetime.fromisoformat(stored_generator.getTimestamp().replace('T', ' '))
+            day_ago = datetime.utcnow() - timedelta(days=1)
+            if stored_cis_ts < day_ago:
+                document = remote_oval(sources_url, filename)
+                generator = document.getGenerator()
+                cis_data_ts = datetime.fromisoformat(generator.getTimestamp().replace('T', ' '))
+                if cis_data_ts > stored_cis_ts:
+                    process = True
         if process is False:
+            logger.info('process is False')
             return
         if document is None:
             document = remote_oval(sources_url, filename)
@@ -1233,18 +1268,28 @@ def main(sources :list):
             definition = definition_to_dict(item)
             if definition is None:
                 continue
+            published = datetime.fromisoformat(definition.get('submitted_at')).replace(tzinfo=None)
+            if published < not_before:
+                logger.info(f'{published} < {not_before}')
+                continue
             definition['cpe_refs'] = cpe_from_definitions(document, definition['cpe_definitions'])
-            # print(json.dumps(definition, default=str))
-            # break
             save_definition(definition)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
+    parser.add_argument('--not-before', help='ISO format datetime string to skip all OVAL records published until this time', dest='not_before', default=None)
+    args = parser.parse_args()
+    not_before = datetime(year=int(args.year), month=1 , day=1)
+    if args.not_before is not None:
+        not_before = datetime.strptime(args.not_before, DATE_FMT)
+
     remote_sources = [
         ('cis.xml', f'https://oval.cisecurity.org/repository/download/{OVAL_SCHEMA_VERSION}/all/oval.xml'),
     ]
     year = datetime.utcnow().year
-    while year >= 2005:
+    while year >= args.year:
         remote_sources.append((f'com.redhat.rhsa-{year}.xml', f'https://www.redhat.com/security/data/oval/com.redhat.rhsa-{year}.xml'))
         year -= 1
 
-    main(remote_sources)
+    main(remote_sources, not_before)
