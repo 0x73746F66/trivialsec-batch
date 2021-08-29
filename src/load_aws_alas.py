@@ -1,14 +1,15 @@
 from xml.etree.ElementTree import Element, ElementTree
 import re
 import logging
+import argparse
 import pathlib
 import requests
+import pytz
 from datetime import datetime
 from requests.exceptions import ConnectTimeout, ReadTimeout
 from retry.api import retry
 from bs4 import BeautifulSoup as bs
 from trivialsec.models.cve import CVE
-from trivialsec.models.cve_reference import CVEReference
 from trivialsec.models.cve_remediation import CVERemediation
 from trivialsec.helpers.config import config
 
@@ -28,8 +29,14 @@ if config.http_proxy or config.https_proxy:
 AMZ_DATE_FORMAT = "%a, %d %b %Y %H:%M:%S %Z"
 USER_AGENT = 'trivialsec.com'
 BASE_URL = 'https://alas.aws.amazon.com/'
-DATAFILE_DIR = 'datafiles/feeds/alas'
+DATAFILE_DIR = '/var/cache/trivialsec/'
 ALAS_PATTERN = r"(ALAS\-\d{4}\-\d*)"
+ISO_FMT = "%Y-%m-%dT%H:%MZ"
+DEFAULT_START_YEAR = 2011
+FEEDS = {
+    f'{DATAFILE_DIR}amzl1.xml': f'{BASE_URL}alas.rss',
+    f'{DATAFILE_DIR}amzl2.xml': f'{BASE_URL}AL2/alas.rss'
+}
 
 @retry((ConnectTimeout, ReadTimeout), tries=10, delay=30, backoff=5)
 def fetch_url(url :str):
@@ -106,46 +113,79 @@ def save_alas(data :dict):
             continue
         cve = CVE()
         cve.cve_id = cve_ref
-        if not cve.exists():
+        original_cve = CVE()
+        if cve.hydrate():
+            original_cve = cve
+        else:
             cve.assigner = 'Unknown'
             cve.title = data["title"]
             cve.description = f'{source}\n{data.get("issue_overview", "")}'.strip()
-            cve.published_at = datetime.strptime(data['pubDate'], AMZ_DATE_FORMAT)
-            cve.last_modified = datetime.strptime(data['lastBuildDate'], AMZ_DATE_FORMAT)
-            cve.persist()
+            cve.published_at = datetime.strptime(data['pubDate'], AMZ_DATE_FORMAT).replace(tzinfo=pytz.UTC)
+            cve.last_modified = datetime.strptime(data['lastBuildDate'], AMZ_DATE_FORMAT).replace(tzinfo=pytz.UTC)
+
+        reference_urls = set()
+        for ref in original_cve.references:
+            reference_urls.add(ref['url'])
+
+        if data['link'] not in reference_urls:
+            original_cve.references.append({
+                'url': data['link'],
+                'name': data['vendor_id'],
+                'source': source,
+                'tags': data.get('affected_packages'),
+            })
+        cve.references = original_cve.references
+        extra = None
+        doc = cve.get_doc()
+        if doc is not None:
+            extra = doc.get('_source', {}).get('_nvd')
+        if len(cve.references) > len(original_cve.references):
+            cve.persist(extra=extra)
+
         cve_remediation = CVERemediation()
         cve_remediation.cve_id = cve_ref
+        if cve_remediation.exists():
+            continue
         cve_remediation.type = 'patch'
         cve_remediation.source = source
         cve_remediation.source_id = data['vendor_id']
         cve_remediation.source_url = data['link']
         cve_remediation.description = f"{data.get('issue_correction', '')}\n\n{data.get('new_packages', '')}".strip()
-        cve_remediation.published_at = datetime.strptime(data['lastBuildDate'], AMZ_DATE_FORMAT)
+        cve_remediation.published_at = datetime.strptime(data['lastBuildDate'], AMZ_DATE_FORMAT).replace(tzinfo=pytz.UTC)
         cve_remediation.persist()
-        if 'cve.mitre.org' in data['link']:
-            continue
-        cve_reference = CVEReference()
-        cve_reference.cve_id = cve_ref
-        cve_reference.url = data['link']
-        cve_reference.name = data['vendor_id']
-        cve_reference.source = source
-        cve_reference.tags = data.get('affected_packages')
-        cve_reference.persist()
 
-def main(feeds :dict):
-    for feed_file, feed_url in feeds.items():
+def main(not_before :datetime):
+    print('not_before')
+    print(not_before)
+    not_before_utc = not_before.replace(tzinfo=pytz.UTC)
+    print('not_before_utc')
+    print(not_before_utc)
+    not_before_local = pytz.utc.localize(not_before)
+    print('not_before_local')
+    print(not_before_local)
+    for feed_file, feed_url in FEEDS.items():
         channel = download_xml_file(feed_url, feed_file)
         if not isinstance(channel, Element):
             continue
         alas_data = parse_xml(channel)
         for data in reversed(alas_data):
+            published = datetime.strptime(data['pubDate'], AMZ_DATE_FORMAT)
+            if published < not_before:
+                continue
             html_content = fetch_url(data['link'])
             if html_content:
-                data |= html_to_dict(html_content)
+                data = {**data, **html_to_dict(html_content)}
             save_alas(data)
+            break
+        break
 
 if __name__ == "__main__":
-    main({
-        f'{DATAFILE_DIR}-amzl1.xml': f'{BASE_URL}alas.rss',
-        f'{DATAFILE_DIR}-amzl2.xml': f'{BASE_URL}AL2/alas.rss'
-    })
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
+    parser.add_argument('--not-before', help='ISO format datetime string to skip all RSS records published until this time', dest='not_before', default=None)
+    args = parser.parse_args()
+    not_before = datetime(year=int(args.year), month=1 , day=1)
+    if args.not_before is not None:
+        not_before = datetime.strptime(args.not_before, ISO_FMT)
+
+    main(not_before)

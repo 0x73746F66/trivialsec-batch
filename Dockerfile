@@ -16,13 +16,23 @@ ENV AWS_REGION ${AWS_REGION}
 ENV AWS_ACCESS_KEY_ID ${AWS_ACCESS_KEY_ID}
 ENV AWS_SECRET_ACCESS_KEY ${AWS_SECRET_ACCESS_KEY}
 ENV LOG_LEVEL ${LOG_LEVEL}
+ENV TZ="Australia/Sydney"
 
 WORKDIR /srv/app
 USER root
-RUN mkdir -p /var/log/trivialsec /var/cache/trivialsec
+COPY conf/crontab /etc/cron.d/trivialsec
+RUN mkdir -p /var/log/trivialsec /var/cache/trivialsec \
+    && chown -R trivialsec:trivialsec /var/log/trivialsec /var/cache/trivialsec \
+    && echo "Installing System Packages" \
+    && apt-get -q update \
+    && apt-get -qy install cron \
+    && chmod 600 /etc/cron.d/trivialsec \
+    && echo "Clean up..." \
+    && apt-get autoremove -y \
+    && apt-get clean \
+    && rm -rf /tmp/* /var/lib/apt/lists/*
+
 USER trivialsec
-COPY --chown=trivialsec:trivialsec conf/crontab scheduler
-COPY --chown=trivialsec:trivialsec bin/entrypoint /entrypoint
 RUN python3 -m pip install -q --no-cache-dir --no-warn-script-location -U pip 2>/dev/null \
     && echo "Cloning Python Libs Package from Gitlab" \
     && git clone -q -c advice.detachedHead=false --depth 1 --branch ${COMMON_VERSION} --single-branch https://${GITLAB_USER}:${GITLAB_PASSWORD}@gitlab.com/trivialsec/python-common.git /tmp/python-libs \
@@ -33,9 +43,9 @@ RUN python3 -m pip install -q --no-cache-dir --no-warn-script-location -U pip 2>
     && echo "Clean up..." \
     && rm -rf /tmp/python-libs
 
+COPY --chown=trivialsec:trivialsec *.env .
 COPY --chown=trivialsec:trivialsec src src
 COPY --chown=trivialsec:trivialsec requirements.txt requirements.txt
-RUN pip install -q --user -r requirements.txt
-
-ENTRYPOINT ["/entrypoint"]
-CMD ["crond", "-f", "-l", "8"]
+RUN pip install --user -r requirements.txt
+USER root
+CMD ["cron", "-f", "-l", "8"]

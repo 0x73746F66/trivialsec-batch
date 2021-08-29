@@ -1,1 +1,5 @@
-* * * * * /usr/bin/python3 /srv/app/src/load_nvd_cve.py >> /var/log/trivialsec/load_nvd_cve.log 2>&1
+#-----------------------------------------------------------------------------
+# Min       Hour    Day     Month   Day     User        Command
+#-----------------------------------------------------------------------------
+55          23      *       *       *       trivialsec  /usr/local/bin/python3 /srv/app/src/load_nvd_cve.py -y $(date '+\%Y') --not-before $(date '+\%Y-\%m-\%dT00:00Z' -d "1 day ago") >> /var/log/trivialsec/load_nvd_cve.log 2>&1
+5,20,35,50  *       *       *       *       trivialsec  /usr/local/bin/python3 /srv/app/src/load_aws_alas.py >> /var/log/trivialsec/load_aws_alas.log 2>&1

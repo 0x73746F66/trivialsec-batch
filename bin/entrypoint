@@ -1,4 +1,0 @@
-#!/bin/sh
-set -e
-crontab /srv/app/scheduler
-exec $@
