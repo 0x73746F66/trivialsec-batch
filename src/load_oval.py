@@ -1,3 +1,4 @@
+import atexit
 import logging
 import pathlib
 import argparse
@@ -7,6 +8,7 @@ from datetime import datetime, timedelta
 from xml.etree.ElementTree import Element, ElementTree
 import requests
 from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
+from elasticsearch import Elasticsearch
 from retry.api import retry
 from trivialsec.helpers.config import config
 from trivialsec.models.cve import CVE
@@ -19,12 +21,19 @@ DATAFILE_DIR = '/var/cache/trivialsec'
 CVE_PATTERN = r"(CVE\-\d{4}\-\d*)"
 DATE_FMT = "%Y-%m-%dT%H:%M:%S"
 DEFAULT_START_YEAR = 2005
+DEFAULT_INDEX = 'cves'
 PROXIES = None
 if config.http_proxy or config.https_proxy:
     PROXIES = {
         'http': f'http://{config.http_proxy}',
         'https': f'https://{config.https_proxy}'
     }
+REPORT = {
+    'total': 0,
+    'skipped': 0,
+    'updates': 0,
+    'new': 0,
+}
 
 """
 https://github.com/CISecurity/OVALRepo/blob/master/scripts/lib_oval.py
@@ -1189,11 +1198,14 @@ def cpe_from_definitions(document :OvalDocument, definitions :list):
 
 def save_definition(definition :dict):
     for cve_id in definition.get('cve', []):
+        REPORT['total'] += 1
         cve = CVE()
         cve.cve_id = cve_id
         original_cve = CVE()
+        update = False
         save = False
         if cve.hydrate():
+            update = True
             original_cve = cve
         else:
             cve.assigner = 'Unknown'
@@ -1219,6 +1231,7 @@ def save_definition(definition :dict):
             if vendor.get('ref_url') is None:
                 continue
             if vendor.get('ref_url') not in remediation_sources:
+                remediation_sources.add(vendor.get('ref_url'))
                 cve.remediation.append({
                     'type': 'patch',
                     'source': definition.get('oval_id'),
@@ -1234,6 +1247,7 @@ def save_definition(definition :dict):
             if 'cve.mitre.org' in vendor.get('ref_url'):
                 continue
             if vendor.get('ref_url') not in reference_urls:
+                reference_urls.add(vendor.get('ref_url'))
                 cve.references.append({
                     'url': vendor.get('ref_url'),
                     'name': vendor.get('ref_id'),
@@ -1249,11 +1263,17 @@ def save_definition(definition :dict):
 
         cve.cpe = list(cpes)
         if save is True:
+            REPORT['new' if update is False else 'updates'] += 1
             extra = None
             doc = cve.get_doc()
             if doc is not None:
-                extra = {'_nvd': doc.get('_source', {}).get('_nvd')}
+                extra = {
+                    '_nvd': doc.get('_source', {}).get('_nvd'),
+                    '_xforce': doc.get('_source', {}).get('_xforce')
+                }
             cve.persist(extra=extra)
+        else:
+            REPORT['skipped'] += 1
 
 def main(sources :list, not_before :datetime, process :bool = False):
     for source_file, sources_url in sources:
@@ -1281,17 +1301,33 @@ def main(sources :list, not_before :datetime, process :bool = False):
         for item in document.getDefinitions():
             definition = definition_to_dict(item)
             if definition is None:
+                REPORT['total'] += 1
+                REPORT['skipped'] += 1
                 continue
             if definition.get('submitted_at') is not None:
                 published = datetime.fromisoformat(definition.get('submitted_at')).replace(tzinfo=None)
                 if published < not_before:
                     logger.info(f'{published} < {not_before}')
+                    REPORT['total'] += 1
+                    REPORT['skipped'] += 1
                     continue
             definition['cpe_refs'] = cpe_from_definitions(document, definition['cpe_definitions'])
             save_definition(definition)
 
+def report():
+    end = datetime.utcnow()
+    epoch = datetime(1970,1,1)
+    elapsed = (end-epoch).total_seconds()-(start-epoch).total_seconds()
+    REPORT['start'] = str(start)
+    REPORT['end'] = str(end)
+    REPORT['elapsed'] = str(timedelta(seconds=elapsed))
+    print(repr(REPORT))
+
 if __name__ == "__main__":
+    start = datetime.utcnow()
+    atexit.register(report)
     parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
     parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all OVAL records published until this time', dest='not_before', default=None)
     parser.add_argument('-f', '--force-process', help='Just process the stored file, if it exists', dest='force', action="store_true")
@@ -1313,6 +1349,9 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=log_level
     )
+    es = Elasticsearch(f"{config.elasticsearch.get('scheme')}{config.elasticsearch.get('host')}:{config.elasticsearch.get('port')}")
+    es.indices.create(index=args.index, ignore=400)
+
     not_before = datetime(year=int(args.year), month=1 , day=1)
     if args.not_before is not None:
         not_before = datetime.strptime(args.not_before, DATE_FMT)
@@ -1321,7 +1360,7 @@ if __name__ == "__main__":
         ('cis.xml', f'https://oval.cisecurity.org/repository/download/{OVAL_SCHEMA_VERSION}/all/oval.xml'),
     ]
     year = datetime.utcnow().year
-    while year >= args.year:
+    while year >= int(args.year):
         remote_sources.append((f'com.redhat.rhsa-{year}.xml', f'https://www.redhat.com/security/data/oval/com.redhat.rhsa-{year}.xml'))
         year -= 1
 

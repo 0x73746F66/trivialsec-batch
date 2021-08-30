@@ -1,14 +1,16 @@
-from xml.etree.ElementTree import Element, ElementTree
+import atexit
 import re
 import logging
 import argparse
 import pathlib
 import requests
 import pytz
-from datetime import datetime
+from xml.etree.ElementTree import Element, ElementTree
+from datetime import datetime, timedelta
 from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
 from retry.api import retry
 from bs4 import BeautifulSoup as bs
+from elasticsearch import Elasticsearch
 from trivialsec.models.cve import CVE
 from trivialsec.helpers.config import config
 
@@ -28,9 +30,16 @@ DATAFILE_DIR = '/var/cache/trivialsec/'
 ALAS_PATTERN = r"(ALAS\-\d{4}\-\d*)"
 AMZ_DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2011
+DEFAULT_INDEX = 'cves'
 FEEDS = {
     f'{DATAFILE_DIR}amzl1.xml': f'{BASE_URL}alas.rss',
     f'{DATAFILE_DIR}amzl2.xml': f'{BASE_URL}AL2/alas.rss'
+}
+REPORT = {
+    'total': 0,
+    'skipped': 0,
+    'updates': 0,
+    'new': 0,
 }
 
 @retry((ConnectTimeout, ReadTimeout, ConnectionError), tries=10, delay=30, backoff=5)
@@ -105,13 +114,17 @@ def save_alas(data :dict):
     amz_linux_family = 2 if 'AL2/alas' in data['feed_url'] else 1
     source = f'Amazon Linux {amz_linux_family} AMI Security Bulletin'
     for cve_ref in data.get('cve_refs', []):
+        REPORT['total'] += 1
+        update = False
         if cve_ref == 'CVE-PENDING':
+            REPORT['skipped'] += 1
             continue
         save = False
         cve = CVE()
         cve.cve_id = cve_ref
         original_cve = CVE()
         if cve.hydrate():
+            update = True
             original_cve = cve
         else:
             cve.assigner = 'Unknown'
@@ -130,6 +143,7 @@ def save_alas(data :dict):
 
         cve.references = original_cve.references or []
         if data['link'] not in reference_urls:
+            reference_urls.add(data['link'])
             cve.references.append({
                 'url': data['link'],
                 'name': data['vendor_id'],
@@ -139,6 +153,7 @@ def save_alas(data :dict):
             save = True
         cve.remediation = original_cve.remediation or []
         if data['link'] not in remediation_sources:
+            remediation_sources.add(data['link'])
             cve.remediation.append({
                 'type': 'patch',
                 'source': source,
@@ -152,11 +167,17 @@ def save_alas(data :dict):
             save = True
 
         if save is True:
+            REPORT['new' if update is False else 'updates'] += 1
             extra = None
             doc = cve.get_doc()
             if doc is not None:
-                extra = {'_nvd': doc.get('_source', {}).get('_nvd')}
+                extra = {
+                    '_nvd': doc.get('_source', {}).get('_nvd'),
+                    '_xforce': doc.get('_source', {}).get('_xforce')
+                }
             cve.persist(extra=extra)
+        else:
+            REPORT['skipped'] += 1
 
 def main(not_before :datetime, force :bool = False):
     for feed_file, feed_url in FEEDS.items():
@@ -167,6 +188,8 @@ def main(not_before :datetime, force :bool = False):
         for data in reversed(alas_data):
             published = datetime.strptime(data['pubDate'], AMZ_DATE_FORMAT)
             if force is False and published < not_before:
+                REPORT['total'] += 1
+                REPORT['skipped'] += 1
                 continue
             html_content = fetch_url(data['link'])
             if html_content:
@@ -174,8 +197,20 @@ def main(not_before :datetime, force :bool = False):
             data['feed_url'] = feed_url
             save_alas(data)
 
+def report():
+    end = datetime.utcnow()
+    epoch = datetime(1970,1,1)
+    elapsed = (end-epoch).total_seconds()-(start-epoch).total_seconds()
+    REPORT['start'] = str(start)
+    REPORT['end'] = str(end)
+    REPORT['elapsed'] = str(timedelta(seconds=elapsed))
+    print(repr(REPORT))
+
 if __name__ == "__main__":
+    start = datetime.utcnow()
+    atexit.register(report)
     parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
     parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all RSS records published until this time', dest='not_before', default=None)
     parser.add_argument('-f', '--force-process', help='Force processing all records', dest='force', action="store_true")
@@ -197,6 +232,9 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=log_level
     )
+    es = Elasticsearch(f"{config.elasticsearch.get('scheme')}{config.elasticsearch.get('host')}:{config.elasticsearch.get('port')}")
+    es.indices.create(index=args.index, ignore=400)
+
     not_before = datetime(year=int(args.year), month=1 , day=1)
     if args.not_before is not None:
         not_before = datetime.strptime(args.not_before, AMZ_DATE_FMT)

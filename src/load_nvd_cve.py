@@ -1,3 +1,4 @@
+import atexit
 import json
 import gzip
 import argparse
@@ -5,7 +6,8 @@ import urllib.request
 import logging
 import pathlib
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
+from elasticsearch import Elasticsearch
 from trivialsec.models.cve import CVE
 from trivialsec.helpers.config import config
 
@@ -23,6 +25,13 @@ BASE_URL = 'https://nvd.nist.gov'
 DATAFILE_DIR = '/var/cache/trivialsec'
 DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2002
+DEFAULT_INDEX = 'cves'
+REPORT = {
+    'total': 0,
+    'skipped': 0,
+    'updates': 0,
+    'new': 0,
+}
 
 def download_gzip(url, out_file):
     try:
@@ -58,7 +67,10 @@ def normalise_cve_item(item :dict) -> CVE:
     cve.cve_id = item['cve']['CVE_data_meta']['ID']
     original_cve = CVE()
     if cve.hydrate():
+        REPORT['updates'] += 1
         original_cve = cve
+    else:
+        REPORT['new'] += 1
 
     cve.assigner = item['cve']['CVE_data_meta'].get('ASSIGNER', 'cve@mitre.org')
     description = []
@@ -80,21 +92,23 @@ def normalise_cve_item(item :dict) -> CVE:
     if 'baseMetricV3' in item['impact'] and 'cvssV3' in item['impact']['baseMetricV3']:
         vd = CVE.vector_to_dict(item['impact']['baseMetricV3']['cvssV3']['vectorString'], 3)
         # maintain values not coming from NVD
-        for vec in ['E', 'RL', 'RC', 'MAV', 'MAC', 'MPR', 'MUI', 'MS', 'MC', 'MI', 'MA', 'CR', 'IR', 'AR']:
-            if original_vector.get(vec):
-                vd[vec] = original_vector.get(vec)
+        if original_cvss_version in ['3.0', '3.1']:
+            for vec in ['E', 'RL', 'RC', 'MAV', 'MAC', 'MPR', 'MUI', 'MS', 'MC', 'MI', 'MA', 'CR', 'IR', 'AR']:
+                if original_vector.get(vec):
+                    vd[vec] = original_vector.get(vec)
         vector = CVE.dict_to_vector(vd, 3)
         cvss_version = vd.get('CVSS', '3.1')
         base_score = item['impact']['baseMetricV3']['cvssV3']['baseScore']
         exploitability_score = item['impact']['baseMetricV3']['exploitabilityScore']
         impact_score = item['impact']['baseMetricV3']['impactScore']
-    elif 'baseMetricV2' in item['impact'] and 'cvssV2' in item['impact']['baseMetricV2']:
+    elif original_cvss_version not in ['3.0', '3.1'] and 'baseMetricV2' in item['impact'] and 'cvssV2' in item['impact']['baseMetricV2']:
         vd = CVE.vector_to_dict(item['impact']['baseMetricV2']['cvssV2']['vectorString'], 2)
         cvss_version = vd.get('CVSS', '2.0')
         # maintain values not coming from NVD
-        for vec in ['E', 'RL', 'RC', 'CDP', 'TD', 'CR', 'IR', 'AR']:
-            if original_vector.get(vec):
-                vd[vec] = original_vector.get(vec)
+        if original_cvss_version == '2.0':
+            for vec in ['E', 'RL', 'RC', 'CDP', 'TD', 'CR', 'IR', 'AR']:
+                if original_vector.get(vec):
+                    vd[vec] = original_vector.get(vec)
         vector = CVE.dict_to_vector(vd, 2)
         base_score = item['impact']['baseMetricV2']['cvssV2']['baseScore']
         exploitability_score = item['impact']['baseMetricV2']['exploitabilityScore']
@@ -128,6 +142,7 @@ def normalise_cve_item(item :dict) -> CVE:
         if 'cve.mitre.org' in ref.get('url'):
             continue
         if ref.get('url') not in reference_urls:
+            reference_urls.add(ref.get('url'))
             original_cve.references.append({
                 'url': ref.get('url'),
                 'name': ref.get('name'),
@@ -141,8 +156,10 @@ def main(start_year :int = DEFAULT_START_YEAR, not_before :datetime = datetime.u
     year = start_year or DEFAULT_START_YEAR
     while year <= datetime.utcnow().year:
         for item in cve_items_by_year(year):
+            REPORT['total'] += 1
             published = datetime.strptime(item['publishedDate'], DATE_FMT)
             if force is False and published < not_before:
+                REPORT['skipped'] += 1
                 continue
             cve = normalise_cve_item(item)
             if not cve.persist(extra={'_nvd': item}):
@@ -150,8 +167,20 @@ def main(start_year :int = DEFAULT_START_YEAR, not_before :datetime = datetime.u
 
         year += 1
 
+def report():
+    end = datetime.utcnow()
+    epoch = datetime(1970,1,1)
+    elapsed = (end-epoch).total_seconds()-(start-epoch).total_seconds()
+    REPORT['start'] = str(start)
+    REPORT['end'] = str(end)
+    REPORT['elapsed'] = str(timedelta(seconds=elapsed))
+    print(repr(REPORT))
+
 if __name__ == "__main__":
+    start = datetime.utcnow()
+    atexit.register(report)
     parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
     parser.add_argument('-y', '--year', help='CVE files are sorted by year, optionally specify a single year', dest='year', default=None)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all CVE records published until this time', dest='not_before', default=None)
     parser.add_argument('-f', '--force-process', help='Force processing all records', dest='force', action="store_true")
@@ -173,6 +202,9 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=log_level
     )
+    es = Elasticsearch(f"{config.elasticsearch.get('scheme')}{config.elasticsearch.get('host')}:{config.elasticsearch.get('port')}")
+    es.indices.create(index=args.index, ignore=400)
+
     start_year=DEFAULT_START_YEAR if args.year is None else int(args.year)
     not_before = datetime(year=start_year, month=1 , day=1)
     if args.not_before is not None:

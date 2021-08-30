@@ -1,27 +1,26 @@
-import glob
+import atexit
 import json
 import logging
 import pathlib
+import argparse
 from random import randint
 from time import sleep
 from datetime import datetime, timedelta
 import requests
 from retry.api import retry
-from requests.exceptions import ConnectTimeout, ReadTimeout
+from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
+from elasticsearch import Elasticsearch
 from trivialsec.models.cve import CVE
-from trivialsec.models.cve_remediation import CVERemediation
-from trivialsec.models.cve_reference import CVEReference
 from trivialsec.helpers.config import config
 
 
 session = requests.Session()
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
-    level=logging.INFO
-)
 BASE_URL = 'https://exchange.xforce.ibmcloud.com'
-DATAFILE_DIR = 'datafiles/xforce/vulnerabilities'
+DATAFILE_DIR = '/var/cache/trivialsec'
+DATE_FMT = "%Y-%m-%dT%H:%MZ"
+DEFAULT_START_YEAR = 2002
+DEFAULT_INDEX = 'cves'
 PROXIES = None
 SOURCE = 'IBM X-Force Exchange'
 if config.http_proxy or config.https_proxy:
@@ -29,6 +28,12 @@ if config.http_proxy or config.https_proxy:
         'http': f'http://{config.http_proxy}',
         'https': f'https://{config.https_proxy}'
     }
+REPORT = {
+    'total': 0,
+    'skipped': 0,
+    'updates': 0,
+    'new': 0,
+}
 v2_0 = {
     'E': {
         'High': 'E:H',
@@ -48,85 +53,156 @@ v2_0 = {
         'Confirmed': 'RC:C',
     }
 }
+def store_cve(data :dict, xforce :dict):
+    REPORT['total'] += 1
+    update = False
+    save = False
+    cve = CVE()
+    cve.cve_id = data['cve_id']
+    original_cve = CVE()
+    if cve.hydrate():
+        update = True
+        original_cve = cve
+    else:
+        cve.assigner = 'Unknown'
+        cve.description = data['description']
+    if data.get('temporal_score') is not None:
+        cve.temporal_score = data.get('temporal_score')
+        save = True
+    if data.get('title') is not None:
+        cve.title = data.get('title')
+        save = True
 
-def process_file(filename :str):
+    reference_urls = set()
+    for ref in original_cve.references or []:
+        reference_urls.add(ref['url'])
+    cve.references = original_cve.references or []
+    remediation_sources = set()
+    for remediation in original_cve.remediation or []:
+        remediation_sources.add(remediation['source_url'])
+
+    for reference in data['references']:
+        if 'cve.mitre.org' in reference.get('url'):
+            continue
+        if reference.get('ref_url') not in reference_urls:
+            reference_urls.add(reference.get('ref_url'))
+            cve.references.append(reference)
+            save = True
+    for remediation in data['remediation']:
+        if remediation.get('source_url') is None:
+            continue
+        if remediation.get('ref_url') not in remediation_sources:
+            remediation_sources.add(remediation.get('ref_url'))
+            cve.remediation.append(remediation)
+            save = True
+    if data['vector'] is not None and data['cvss_version'] in ['3.0', '3.1']:
+        vd = CVE.vector_to_dict(data['vector'], 3)
+        if original_cve.cvss_version not in ['3.0', '3.1']:
+            cve.cvss_version = vd['CVSS']
+            cve.vector = CVE.dict_to_vector(vd, 3)
+            save = True
+        else:
+            original_vd = CVE.vector_to_dict(data['vector'], 3)
+            cvss_updated = False
+            if original_vd['E'] == 'X':
+                original_vd['E'] = vd['E']
+                cvss_updated = True
+            if original_vd['RL'] == 'X':
+                original_vd['RL'] = vd['RL']
+                cvss_updated = True
+            if original_vd['RC'] == 'X':
+                original_vd['RC'] = vd['RC']
+                cvss_updated = True
+            if cvss_updated is True:
+                cve.vector = CVE.dict_to_vector(original_vd, 3)
+                cve.cvss_version = original_vd['CVSS']
+                save = True
+    if cve.reported_at is None and data.get('reported_at') is not None:
+        cve.reported_at = data.get('reported_at')
+        save = True
+    if cve.base_score is None and data.get('base_score') is not None:
+        cve.base_score = data.get('base_score')
+        save = True
+    if cve.temporal_score is None and data.get('temporal_score') is not None:
+        cve.temporal_score = data.get('temporal_score')
+        save = True
+
+    logger.debug(f'Save? {save}')
+    if save is True:
+        REPORT['new' if update is False else 'updates'] += 1
+        extra = None
+        doc = cve.get_doc()
+        if doc is not None:
+            extra = {
+                '_nvd': doc.get('_source', {}).get('_nvd'),
+                '_xforce': xforce
+            }
+        cve.persist(extra=extra)
+    else:
+        REPORT['skipped'] += 1
+
+def parse_file_to_dict(filename :str):
     xforce_file = pathlib.Path(filename)
     if not xforce_file.is_file():
+        logger.error(f'File not found {filename}')
         return
     raw_text = xforce_file.read_text()
     xforce_data = json.loads(raw_text)
     for cve_ref in xforce_data.get('stdcode', []):
         cve_ref = f"{cve_ref.upper().replace('CVE ', 'CVE-').replace('‑', '-').replace('–', '-')}"
         if not cve_ref.startswith('CVE-'):
+            logger.warning(f'Skipping {cve_ref}')
             continue
+        logger.debug(f'Normalising {cve_ref}')
         try:
-            cve = CVE()
-            cve.cve_id=cve_ref
-            if cve.exists():
-                cve.hydrate()
-                cve.temporal_score = xforce_data.get('temporal_score')
-                cve.persist()
-            else:
-                cve.assigner = 'Unknown'
-                cve.title = xforce_data['title']
-                cve.description = xforce_data['description']
-                if xforce_data['cvss']['version'] == '2.0':
-                    vd = CVE.vector_to_dict(xforce_data['cvss_vector'], 2)
-                    cve.vector = CVE.dict_to_vector(vd, 2)
-                    cve.cvss_version = vd.get('CVSS', xforce_data['cvss']['version'])
-                if xforce_data['cvss']['version'] in ['3.0', '3.1']:
-                    vd = CVE.vector_to_dict(xforce_data['cvss_vector'], 3)
-                    cve.vector = CVE.dict_to_vector(vd, 3)
-                    cve.cvss_version = vd.get('CVSS', xforce_data['cvss']['version'])
-                cve.base_score = xforce_data['risk_level']
-                cve.temporal_score = xforce_data.get('temporal_score')
-                cve.reported_at = xforce_data['reported'].replace('T', ' ').replace('Z', '')
-                cve.last_modified = cve.reported_at
-                cve.persist()
+            data = {
+                'cve_id': cve_ref,
+                'title': xforce_data['title'],
+                'description': xforce_data['description'],
+                'vector': None,
+                'cvss_version': None,
+                'references': [],
+                'remediation': [],
+            }
+            if xforce_data['cvss']['version'] == '2.0':
+                vd = CVE.vector_to_dict(xforce_data['cvss_vector'], 2)
+                data['vector'] = CVE.dict_to_vector(vd, 2)
+                data['cvss_version'] = vd.get('CVSS', xforce_data['cvss']['version'])
+            if xforce_data['cvss']['version'] in ['3.0', '3.1']:
+                vd = CVE.vector_to_dict(xforce_data['cvss_vector'], 3)
+                data['vector'] = CVE.dict_to_vector(vd, 3)
+                data['cvss_version'] = vd.get('CVSS', xforce_data['cvss']['version'])
+
+            data['base_score'] = xforce_data['risk_level']
+            data['temporal_score'] = xforce_data.get('temporal_score')
+            data['reported_at'] = xforce_data['reported'].replace('Z', '')
 
             for ref in xforce_data['references']:
                 if 'cve.mitre.org' in ref['link_target']:
                     continue
-                reference = CVEReference()
-                reference.cve_id = cve_ref
-                reference.name = ref['link_name']
-                reference.url = ref['link_target']
-                reference.source = SOURCE
-                reference.tags = xforce_data['tagname']
-                reference.persist()
+                data['references'].append({
+                    'url': ref['link_target'],
+                    'name': ref['link_name'],
+                    'source': SOURCE,
+                    'tags': ['Third Party Advisory'],
+                })
 
-            cve_remedy = CVERemediation()
-            cve_remedy.cve_id = cve_ref
-            cve_remedy.type = 'advisory'
-            cve_remedy.source = SOURCE
-            cve_remedy.source_id = xforce_data['xfdbid']
-            cve_remedy.source_url = f"https://exchange.xforce.ibmcloud.com/vulnerabilities/{xforce_data['xfdbid']}"
-            cve_remedy.description = xforce_data['remedy']
-            cve_remedy.published_at = xforce_data['reported'].replace('T', ' ').replace('Z', '')
-            cve_remedy.persist()
+            data['remediation'].append({
+                'type': 'advisory',
+                'source': SOURCE,
+                'source_id': xforce_data['xfdbid'],
+                'source_url': f"{BASE_URL}/vulnerabilities/{xforce_data['xfdbid']}",
+                'affected_packages': xforce_data.get('platforms_affected', []),
+                'contributors': [],
+                'description': xforce_data['remedy'],
+                'published_at':  xforce_data['reported'].replace('Z', ''),
+            })
+
+            yield data
 
         except Exception as ex:
             logger.exception(ex)
             logger.error(f'cve ref {cve_ref} xfdbid {xforce_data["xfdbid"]}')
-
-@retry((ConnectTimeout, ReadTimeout), tries=10, delay=30, backoff=5)
-def query_single(ref_id :int):
-    api_url = f'{BASE_URL}/api/vulnerabilities/{ref_id}'
-    logger.info(api_url)
-    resp = session.get(
-        api_url,
-        proxies=PROXIES,
-        headers={
-            'x-ui': "XFE",
-            'User-Agent': config.user_agent,
-            'origin': BASE_URL
-        },
-        timeout=10
-    )
-    if resp.status_code != 200:
-        logger.info(f'{resp.status_code} {api_url}')
-
-    return resp.text
 
 def xforce_cvss_vector(obj :dict):
     if 'cvss' not in obj:
@@ -187,11 +263,11 @@ def xforce_cvss_vector(obj :dict):
         return None
     return vector
 
-@retry((ConnectTimeout, ReadTimeout), tries=10, delay=30, backoff=5)
+@retry((ConnectTimeout, ReadTimeout, ConnectionError), tries=10, delay=30, backoff=5)
 def query_bulk(start :datetime, end :datetime):
     response = None
     api_url = f'{BASE_URL}/api/vulnerabilities/fulltext?q=vulnerability&startDate={start.isoformat()}Z&endDate={end.isoformat()}Z'
-    logger.info(api_url)
+    logger.debug(api_url)
     resp = session.get(
         api_url,
         proxies=PROXIES,
@@ -203,22 +279,22 @@ def query_bulk(start :datetime, end :datetime):
         timeout=10
     )
     if resp.status_code != 200:
-        logger.info(f'{resp.status_code} {api_url}')
+        logger.error(f'{resp.status_code} {api_url}')
         return response
 
     raw = resp.text
     if raw is None or not raw:
-        logger.info(f'empty response {api_url}')
+        logger.warning(f'empty response {api_url}')
 
     try:
         response = json.loads(raw)
     except json.decoder.JSONDecodeError as ex:
         logger.exception(ex)
-        logger.info(raw)
+        logger.error(raw)
 
     return response
 
-@retry((ConnectTimeout, ReadTimeout), tries=10, delay=30, backoff=5)
+@retry((ConnectTimeout, ReadTimeout, ConnectionError), tries=10, delay=30, backoff=5)
 def query_latest(limit :int = 200):
     response = []
     api_url = f'{BASE_URL}/api/vulnerabilities/?limit={limit}'
@@ -233,16 +309,16 @@ def query_latest(limit :int = 200):
         timeout=10
     )
     if resp.status_code != 200:
-        logger.info(f'{resp.status_code} {api_url}')
+        logger.error(f'{resp.status_code} {api_url}')
     raw = resp.text
     if raw is None or not raw:
-        logger.info(f'empty response {api_url}')
+        logger.warning(f'empty response {api_url}')
 
     try:
         response = json.loads(raw)
     except json.decoder.JSONDecodeError as ex:
         logger.exception(ex)
-        logger.info(raw)
+        logger.error(raw)
 
     return response
 
@@ -255,24 +331,23 @@ def do_latest(limit :int = 200):
             original_data = json.loads(xforce_file.read_text())
             original_data = {**original_data, **item}
             original_data['cvss_vector'] = xforce_cvss_vector(original_data)
-            logger.info(f'UPDATE {datafile_path}')
-            xforce_file.write_text(json.dumps(original_data, default=str, sort_keys=True))
-            process_file(datafile_path)
-            continue
+            item = original_data
 
         item['cvss_vector'] = xforce_cvss_vector(item)
-        logger.info(f'NEW {datafile_path}')
         xforce_file.write_text(json.dumps(item, default=str, sort_keys=True))
-        process_file(datafile_path)
+        logger.info(f'parse {datafile_path}')
+        for data in parse_file_to_dict(datafile_path):
+            store_cve(data, xforce=item)
 
 def do_bulk(start :datetime, end :datetime) -> bool:
     resp = query_bulk(start, end)
     if resp is None:
+        logger.error('query_bulk returned empty response')
         return False
     total_rows = int(resp.get('total_rows', 0))
-    logger.info(f'total_rows {total_rows}')
+    logger.debug(f'total_rows {total_rows}')
     if total_rows == 0:
-        logger.info(f'no data between {start} and {end}')
+        logger.warning(f'no data between {start} and {end}')
         return False
     if total_rows > 200:
         rows = []
@@ -293,74 +368,70 @@ def do_bulk(start :datetime, end :datetime) -> bool:
             logger.debug(datafile)
             original_data = json.loads(xforce_file.read_text())
             original_data = {**original_data, **item}
-            original_data['cvss_vector'] = xforce_cvss_vector(original_data)
-            xforce_file.write_text(json.dumps(original_data, default=str, sort_keys=True))
-            process_file(datafile)
-            continue
+            item = original_data
 
-        logger.info(datafile)
         item['cvss_vector'] = xforce_cvss_vector(item)
         xforce_file.write_text(json.dumps(item, default=str, sort_keys=True))
-        process_file(datafile)
+        for data in parse_file_to_dict(datafile):
+            store_cve(data, xforce=item)
     return True
 
-def read_file(file_path :str):
-    xforce_file = pathlib.Path(file_path)
-    if not xforce_file.is_file():
-        return None
-    item = json.loads(xforce_file.read_text())
-    original_data = json.loads(xforce_file.read_text())
-    original_data = {**original_data, **item}
-    original_data['cvss_vector'] = xforce_cvss_vector(original_data)
-    xforce_json = json.dumps(original_data, default=str, sort_keys=True)
-    xforce_file.write_text(xforce_json)
-    process_file(file_path)
-
-def query_all_individually():
-    next_id = 1
-    while next_id < 206792:
-        datafile = f"{DATAFILE_DIR}/{next_id}.json"
-        original_data = {}
-        xforce_file = pathlib.Path(datafile)
-        if xforce_file.is_file():
-            original_data = json.loads(xforce_file.read_text())
-            original_data['cvss_vector'] = xforce_cvss_vector(original_data)
-            xforce_file.write_text(json.dumps(original_data, default=str, sort_keys=True))
-            process_file(datafile)
-            next_id += 1
-            continue
-
-        try:
-            raw = query_single(next_id)
-            if raw is None:
-                next_id += 1
-                continue
-            response = json.loads(raw)
-            response['cvss_vector'] = xforce_cvss_vector(response)
-            xforce_file.write_text(json.dumps(response, default=str, sort_keys=True))
-            process_file(datafile)
-        except json.decoder.JSONDecodeError as ex:
-            logger.exception(ex)
-            logger.info(raw)
-        next_id += 1
-
-def process_local():
-    for pathname in glob.glob(f"{DATAFILE_DIR}/*.json"):
-        read_file(pathname)
-
-def main():
+def main(not_before :datetime):
     now = datetime.utcnow()
-    not_before = now - timedelta(days=3)
     end = datetime(now.year, now.month, now.day)
     start = end - timedelta(days=1)
     while start > not_before:
-        logger.info(f'between {start} and {end}')
+        logger.warning(f'between {start} and {end}')
         do_bulk(start, end)
         end = start
         start = end - timedelta(days=1)
         sleep(randint(3,6))
 
+def report():
+    end = datetime.utcnow()
+    epoch = datetime(1970,1,1)
+    elapsed = (end-epoch).total_seconds()-(start-epoch).total_seconds()
+    REPORT['start'] = str(start)
+    REPORT['end'] = str(end)
+    REPORT['elapsed'] = str(timedelta(seconds=elapsed))
+    print(repr(REPORT))
+
 if __name__ == "__main__":
-    process_local()
-    # main()
-    # do_latest()
+    start = datetime.utcnow()
+    atexit.register(report)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
+    parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='since_year', default=DEFAULT_START_YEAR)
+    parser.add_argument('--not-before', help='ISO format datetime string to skip all records published until this time', dest='not_before', default=None)
+    parser.add_argument('-r', '--recent', help='Process the latest 1-200 max published records (default 200) change limit using "--recent-limit"', dest='process_latest', action="store_true")
+    parser.add_argument('-l', '--recent-limit', help='Used with "--recent" set between 1-200 max (default 200)', dest='latest_limit', default=200)
+    parser.add_argument('-s', '--only-show-errors', help='set logging level to ERROR (default CRITICAL)', dest='log_level_error', action="store_true")
+    parser.add_argument('-q', '--quiet', help='set logging level to WARNING (default CRITICAL)', dest='log_level_warning', action="store_true")
+    parser.add_argument('-v', '--verbose', help='set logging level to INFO (default CRITICAL)', dest='log_level_info', action="store_true")
+    parser.add_argument('-vv', '--debug', help='set logging level to DEBUG (default CRITICAL)', dest='log_level_debug', action="store_true")
+    args = parser.parse_args()
+    log_level = logging.CRITICAL
+    if args.log_level_error:
+        log_level = logging.ERROR
+    if args.log_level_warning:
+        log_level = logging.WARNING
+    if args.log_level_info:
+        log_level = logging.INFO
+    if args.log_level_debug:
+        log_level = logging.DEBUG
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
+        level=log_level
+    )
+    es = Elasticsearch(f"{config.elasticsearch.get('scheme')}{config.elasticsearch.get('host')}:{config.elasticsearch.get('port')}")
+    es.indices.create(index=args.index, ignore=400)
+
+    start_year=DEFAULT_START_YEAR if args.since_year is None else int(args.since_year)
+    not_before = datetime(year=start_year, month=1 , day=1)
+    if args.not_before is not None:
+        not_before = datetime.strptime(args.not_before, DATE_FMT)
+    if args.process_latest is True:
+        logger.debug('do_latest')
+        do_latest(limit=args.latest_limit)
+    else:
+        main(not_before)
