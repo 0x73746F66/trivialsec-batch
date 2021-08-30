@@ -6,7 +6,7 @@ import pathlib
 import requests
 import pytz
 from datetime import datetime
-from requests.exceptions import ConnectTimeout, ReadTimeout
+from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
 from retry.api import retry
 from bs4 import BeautifulSoup as bs
 from trivialsec.models.cve import CVE
@@ -15,10 +15,6 @@ from trivialsec.helpers.config import config
 
 session = requests.Session()
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
-    level=logging.INFO
-)
 PROXIES = None
 if config.http_proxy or config.https_proxy:
     PROXIES = {
@@ -37,7 +33,7 @@ FEEDS = {
     f'{DATAFILE_DIR}amzl2.xml': f'{BASE_URL}AL2/alas.rss'
 }
 
-@retry((ConnectTimeout, ReadTimeout), tries=10, delay=30, backoff=5)
+@retry((ConnectTimeout, ReadTimeout, ConnectionError), tries=10, delay=30, backoff=5)
 def fetch_url(url :str):
     logger.info(url)
     resp = session.get(
@@ -106,7 +102,8 @@ def parse_xml(channel :Element):
     return results
 
 def save_alas(data :dict):
-    source = 'Amazon Linux AMI Security Bulletin'
+    amz_linux_family = 2 if 'AL2/alas' in data['feed_url'] else 1
+    source = f'Amazon Linux {amz_linux_family} AMI Security Bulletin'
     for cve_ref in data.get('cve_refs', []):
         if cve_ref == 'CVE-PENDING':
             continue
@@ -137,7 +134,7 @@ def save_alas(data :dict):
                 'url': data['link'],
                 'name': data['vendor_id'],
                 'source': source,
-                'tags': data.get('affected_packages'),
+                'tags': ['Vendor Advisory', f'AL{amz_linux_family} ALAS'],
             })
             save = True
         cve.remediation = original_cve.remediation or []
@@ -147,6 +144,8 @@ def save_alas(data :dict):
                 'source': source,
                 'source_id': data.get('vendor_id', data['link'].split('/')[-1]),
                 'source_url': data['link'],
+                'affected_packages': data.get('affected_packages', []),
+                'contributors': [],
                 'description': f"{data.get('issue_correction', '')}\n\n{data.get('new_packages', '')}".strip(),
                 'published_at': datetime.strptime(data['lastBuildDate'], AMZ_DATE_FORMAT).replace(tzinfo=pytz.UTC),
             })
@@ -159,7 +158,7 @@ def save_alas(data :dict):
                 extra = {'_nvd': doc.get('_source', {}).get('_nvd')}
             cve.persist(extra=extra)
 
-def main(not_before :datetime):
+def main(not_before :datetime, force :bool = False):
     for feed_file, feed_url in FEEDS.items():
         channel = download_xml_file(feed_url, feed_file)
         if not isinstance(channel, Element):
@@ -167,20 +166,39 @@ def main(not_before :datetime):
         alas_data = parse_xml(channel)
         for data in reversed(alas_data):
             published = datetime.strptime(data['pubDate'], AMZ_DATE_FORMAT)
-            if published < not_before:
+            if force is False and published < not_before:
                 continue
             html_content = fetch_url(data['link'])
             if html_content:
                 data = {**data, **html_to_dict(html_content)}
+            data['feed_url'] = feed_url
             save_alas(data)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all RSS records published until this time', dest='not_before', default=None)
+    parser.add_argument('-f', '--force-process', help='Force processing all records', dest='force', action="store_true")
+    parser.add_argument('-s', '--only-show-errors', help='set logging level to ERROR (default CRITICAL)', dest='log_level_error', action="store_true")
+    parser.add_argument('-q', '--quiet', help='set logging level to WARNING (default CRITICAL)', dest='log_level_warning', action="store_true")
+    parser.add_argument('-v', '--verbose', help='set logging level to INFO (default CRITICAL)', dest='log_level_info', action="store_true")
+    parser.add_argument('-vv', '--debug', help='set logging level to DEBUG (default CRITICAL)', dest='log_level_debug', action="store_true")
     args = parser.parse_args()
+    log_level = logging.CRITICAL
+    if args.log_level_error:
+        log_level = logging.ERROR
+    if args.log_level_warning:
+        log_level = logging.WARNING
+    if args.log_level_info:
+        log_level = logging.INFO
+    if args.log_level_debug:
+        log_level = logging.DEBUG
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
+        level=log_level
+    )
     not_before = datetime(year=int(args.year), month=1 , day=1)
     if args.not_before is not None:
         not_before = datetime.strptime(args.not_before, AMZ_DATE_FMT)
 
-    main(not_before)
+    main(not_before, force=args.force)

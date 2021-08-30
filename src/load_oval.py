@@ -6,17 +6,13 @@ import xml
 from datetime import datetime, timedelta
 from xml.etree.ElementTree import Element, ElementTree
 import requests
-from requests.exceptions import ConnectTimeout, ReadTimeout
+from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
 from retry.api import retry
 from trivialsec.helpers.config import config
 from trivialsec.models.cve import CVE
 
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
-    level=logging.INFO
-)
 session = requests.Session()
 OVAL_SCHEMA_VERSION = '5.11.2'
 DATAFILE_DIR = '/var/cache/trivialsec'
@@ -1082,7 +1078,7 @@ class OvalVariable(OvalElement):
     def getType(self):
         return OvalElement.VARIABLE
 
-@retry((ConnectTimeout, ReadTimeout), tries=10, delay=30, backoff=5)
+@retry((ConnectTimeout, ReadTimeout, ConnectionError), tries=10, delay=30, backoff=5)
 def query_raw(url :str):
     logger.info(f'Downloading {url}')
     resp = requests.get(url, proxies=PROXIES, headers={'user-agent': config.user_agent}, timeout=300)
@@ -1092,55 +1088,69 @@ def query_raw(url :str):
     return resp.text
 
 def definition_to_dict(definition :OvalDefinition):
-    if definition.getLocalName() != 'definition' or definition.getClass() != 'patch':
-        return None
-
-    cpe_definitions = set()
-    for c1 in definition.element:
-        if not c1.tag.endswith('criteria'):
-            continue
-        for c2 in c1:
-            if not c2.tag.endswith('criteria'):
+    try:
+        if definition.getLocalName() != 'definition' or definition.getClass() != 'patch':
+            return None
+        oval_id = definition.getId()
+        cpe_definitions = set()
+        for c1 in definition.element:
+            if not c1.tag.endswith('criteria'):
                 continue
-            for c3 in c2:
-                if not c3.tag.endswith('extend_definition'):
+            for c2 in c1:
+                if not c2.tag.endswith('criteria'):
                     continue
-                cpe_definitions.add(c3.get('definition_ref'))
+                for c3 in c2:
+                    if not c3.tag.endswith('extend_definition'):
+                        continue
+                    cpe_definitions.add(c3.get('definition_ref'))
 
-    metadata = definition.getMetadata()
-    repository = metadata.getOvalRepositoryInformation()
-    submitted = repository.getSubmitted()
-    submitted_contributor = submitted.get('Contributors')[0]
-    contributors = set()
-    contributors.add((submitted_contributor['Contributor'], submitted_contributor['Organization']))
-    for contributor in repository.getModified().get('Contributors', []):
-        contributors.add((contributor['Contributor'], contributor['Organization']))
+        metadata = definition.getMetadata()
+        description = metadata.getDescription()
+        title = metadata.getTitle()
+        repository = metadata.getOvalRepositoryInformation()
+        contributors = set()
+        status = 'DRAFT'
+        submitted_at = None
+        submitted_by = None
+        if repository is not None:
+            status = repository.getStatus()
+            submitted = repository.getSubmitted()
+            submitted_at = submitted.get('Date')
+            submitted_contributor = submitted.get('Contributors')[0]
+            submitted_by = (submitted_contributor['Contributor'], submitted_contributor['Organization'])
+            contributors.add((submitted_contributor['Contributor'], submitted_contributor['Organization']))
+            for contributor in repository.getModified().get('Contributors', []):
+                contributors.add((contributor['Contributor'], contributor['Organization']))
 
-    cve_refs = set()
-    vendors = []
-    for reference in metadata.element:
-        if not reference.tag.endswith('reference'):
-            continue
-        if reference.get('source') != 'CVE':
-            vendors.append({
-                'ref_id': reference.get('ref_id'),
-                'ref_url': derive_ref_url(reference.get('ref_id'), reference.get('ref_url')),
-            })
-            continue
-        cve_refs.add(reference.get('ref_id'))
+        cve_refs = set()
+        vendors = []
+        for reference in metadata.element:
+            if not reference.tag.endswith('reference'):
+                continue
+            if reference.get('source') != 'CVE':
+                vendors.append({
+                    'ref_id': reference.get('ref_id'),
+                    'ref_url': derive_ref_url(reference.get('ref_id'), reference.get('ref_url')),
+                })
+                continue
+            cve_refs.add(reference.get('ref_id'))
 
-    return {
-        'oval_id': definition.getId(),
-        'title': metadata.getTitle(),
-        'description': metadata.getDescription(),
-        'submitted_at': submitted.get('Date'),
-        'submitted_by': (submitted_contributor['Contributor'], submitted_contributor['Organization']),
-        'status': repository.getStatus(),
-        'cpe_definitions': list(cpe_definitions),
-        'cve': list(cve_refs),
-        'contributors': list(contributors),
-        'vendors': vendors,
-    }
+        return {
+            'oval_id': oval_id,
+            'title': title,
+            'description': description,
+            'submitted_at': submitted_at,
+            'submitted_by': submitted_by,
+            'status': status,
+            'cpe_definitions': list(cpe_definitions),
+            'cve': list(cve_refs),
+            'contributors': list(contributors),
+            'vendors': vendors,
+        }
+    except Exception as ex:
+        for _ in map(print, definition.element.itertext()):
+            pass
+        raise ex
 
 def derive_ref_url(ref_id, ref_url = None):
     if ref_url is not None:
@@ -1188,7 +1198,7 @@ def save_definition(definition :dict):
         else:
             cve.assigner = 'Unknown'
             cve.description = definition.get('description')
-            cve.published_at = datetime.fromisoformat(definition.get('submitted_at'))
+            cve.published_at = definition.get('submitted_at')
             cve.last_modified = datetime.utcnow()
             save = True
 
@@ -1214,8 +1224,10 @@ def save_definition(definition :dict):
                     'source': definition.get('oval_id'),
                     'source_id': vendor.get('ref_id'),
                     'source_url': vendor.get('ref_url'),
+                    'affected_packages': [],
+                    'contributors': definition.get('contributors', []),
                     'description': definition.get('description'),
-                    'published_at': datetime.fromisoformat(definition.get('submitted_at')),
+                    'published_at': definition.get('submitted_at'),
                 })
                 save = True
 
@@ -1226,7 +1238,7 @@ def save_definition(definition :dict):
                     'url': vendor.get('ref_url'),
                     'name': vendor.get('ref_id'),
                     'source': definition.get('oval_id'),
-                    'tags': ','.join(set([item for sublist in definition.get('contributors') for item in sublist])),
+                    'tags': ['Information Sharing', 'OVAL'],
                 })
                 save = True
 
@@ -1243,12 +1255,14 @@ def save_definition(definition :dict):
                 extra = {'_nvd': doc.get('_source', {}).get('_nvd')}
             cve.persist(extra=extra)
 
-def main(sources :list, not_before :datetime):
+def main(sources :list, not_before :datetime, process :bool = False):
     for source_file, sources_url in sources:
         filename = f"{DATAFILE_DIR}/{source_file}"
         stored_document = local_oval(filename)
-        process = stored_document is None
         document = None
+        if process is True:
+            document = stored_document
+        process = True if process is True else stored_document is None
         if stored_document is not None:
             stored_generator = stored_document.getGenerator()
             stored_cis_ts = datetime.fromisoformat(stored_generator.getTimestamp().replace('T', ' '))
@@ -1260,7 +1274,7 @@ def main(sources :list, not_before :datetime):
                 if cis_data_ts > stored_cis_ts:
                     process = True
         if process is False:
-            logger.info('process is False')
+            logger.info('OVAL already processed')
             return
         if document is None:
             document = remote_oval(sources_url, filename)
@@ -1268,10 +1282,11 @@ def main(sources :list, not_before :datetime):
             definition = definition_to_dict(item)
             if definition is None:
                 continue
-            published = datetime.fromisoformat(definition.get('submitted_at')).replace(tzinfo=None)
-            if published < not_before:
-                logger.info(f'{published} < {not_before}')
-                continue
+            if definition.get('submitted_at') is not None:
+                published = datetime.fromisoformat(definition.get('submitted_at')).replace(tzinfo=None)
+                if published < not_before:
+                    logger.info(f'{published} < {not_before}')
+                    continue
             definition['cpe_refs'] = cpe_from_definitions(document, definition['cpe_definitions'])
             save_definition(definition)
 
@@ -1279,7 +1294,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all OVAL records published until this time', dest='not_before', default=None)
+    parser.add_argument('-f', '--force-process', help='Just process the stored file, if it exists', dest='force', action="store_true")
+    parser.add_argument('-s', '--only-show-errors', help='set logging level to ERROR (default CRITICAL)', dest='log_level_error', action="store_true")
+    parser.add_argument('-q', '--quiet', help='set logging level to WARNING (default CRITICAL)', dest='log_level_warning', action="store_true")
+    parser.add_argument('-v', '--verbose', help='set logging level to INFO (default CRITICAL)', dest='log_level_info', action="store_true")
+    parser.add_argument('-vv', '--debug', help='set logging level to DEBUG (default CRITICAL)', dest='log_level_debug', action="store_true")
     args = parser.parse_args()
+    log_level = logging.CRITICAL
+    if args.log_level_error:
+        log_level = logging.ERROR
+    if args.log_level_warning:
+        log_level = logging.WARNING
+    if args.log_level_info:
+        log_level = logging.INFO
+    if args.log_level_debug:
+        log_level = logging.DEBUG
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
+        level=log_level
+    )
     not_before = datetime(year=int(args.year), month=1 , day=1)
     if args.not_before is not None:
         not_before = datetime.strptime(args.not_before, DATE_FMT)
@@ -1292,4 +1325,4 @@ if __name__ == "__main__":
         remote_sources.append((f'com.redhat.rhsa-{year}.xml', f'https://www.redhat.com/security/data/oval/com.redhat.rhsa-{year}.xml'))
         year -= 1
 
-    main(remote_sources, not_before)
+    main(remote_sources, not_before, process=args.force)

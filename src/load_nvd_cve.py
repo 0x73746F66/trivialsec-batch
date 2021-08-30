@@ -12,10 +12,6 @@ from trivialsec.helpers.config import config
 
 session = requests.Session()
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
-    level=logging.INFO
-)
 PROXIES = None
 if config.http_proxy or config.https_proxy:
     PROXIES = {
@@ -136,17 +132,17 @@ def normalise_cve_item(item :dict) -> CVE:
                 'url': ref.get('url'),
                 'name': ref.get('name'),
                 'source': ref.get('refsource'),
-                'tags': ','.join(ref.get('tags')),
+                'tags': ref.get('tags', []),
             })
     cve.references = original_cve.references
     return cve
 
-def process_all(start_year :int = DEFAULT_START_YEAR, not_before :datetime = datetime.utcnow()):
+def main(start_year :int = DEFAULT_START_YEAR, not_before :datetime = datetime.utcnow(), force :bool = False):
     year = start_year or DEFAULT_START_YEAR
     while year <= datetime.utcnow().year:
         for item in cve_items_by_year(year):
             published = datetime.strptime(item['publishedDate'], DATE_FMT)
-            if published < not_before:
+            if force is False and published < not_before:
                 continue
             cve = normalise_cve_item(item)
             if not cve.persist(extra={'_nvd': item}):
@@ -158,9 +154,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-y', '--year', help='CVE files are sorted by year, optionally specify a single year', dest='year', default=None)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all CVE records published until this time', dest='not_before', default=None)
+    parser.add_argument('-f', '--force-process', help='Force processing all records', dest='force', action="store_true")
+    parser.add_argument('-s', '--only-show-errors', help='set logging level to ERROR (default CRITICAL)', dest='log_level_error', action="store_true")
+    parser.add_argument('-q', '--quiet', help='set logging level to WARNING (default CRITICAL)', dest='log_level_warning', action="store_true")
+    parser.add_argument('-v', '--verbose', help='set logging level to INFO (default CRITICAL)', dest='log_level_info', action="store_true")
+    parser.add_argument('-vv', '--debug', help='set logging level to DEBUG (default CRITICAL)', dest='log_level_debug', action="store_true")
     args = parser.parse_args()
+    log_level = logging.CRITICAL
+    if args.log_level_error:
+        log_level = logging.ERROR
+    if args.log_level_warning:
+        log_level = logging.WARNING
+    if args.log_level_info:
+        log_level = logging.INFO
+    if args.log_level_debug:
+        log_level = logging.DEBUG
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
+        level=log_level
+    )
     start_year=DEFAULT_START_YEAR if args.year is None else int(args.year)
     not_before = datetime(year=start_year, month=1 , day=1)
     if args.not_before is not None:
         not_before = datetime.strptime(args.not_before, DATE_FMT)
-    process_all(start_year=start_year, not_before=not_before)
+    main(start_year=start_year, not_before=not_before, force=args.force)
