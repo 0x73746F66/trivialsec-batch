@@ -29,6 +29,7 @@ if config.http_proxy or config.https_proxy:
         'https': f'https://{config.https_proxy}'
     }
 REPORT = {
+    'task': 'oval-patches',
     'total': 0,
     'skipped': 0,
     'updates': 0,
@@ -1219,17 +1220,29 @@ def save_definition(definition :dict):
             save = True
 
         cpes = set(original_cve.cpe or [])
-        reference_urls = set()
-        for ref in original_cve.references or []:
-            reference_urls.add(ref['url'])
-        cve.references = original_cve.references or []
-        remediation_sources = set()
-        for remediation in original_cve.remediation or []:
-            remediation_sources.add(remediation['source_url'])
+        remediation_sources = set([source['source_url'] for source in original_cve.remediation])
+        reference_urls = set([ref['url'] for ref in original_cve.references])
+        cve.remediation = []
+        cve.references = []
+        for reference in original_cve.references:
+            if reference.get('url') not in reference_urls:
+                cve.references.append(reference)
+        for remediation in original_cve.remediation:
+            if remediation.get('source_url') not in remediation_sources:
+                cve.remediation.append(remediation)
 
         for vendor in definition['vendors']:
-            if vendor.get('ref_url') is None:
+            if vendor.get('ref_url') is None or 'cve.mitre.org' in vendor.get('ref_url', ''):
                 continue
+            if vendor.get('ref_url') not in reference_urls:
+                reference_urls.add(vendor.get('ref_url'))
+                cve.references.append({
+                    'url': vendor.get('ref_url'),
+                    'name': vendor.get('ref_id'),
+                    'source': definition.get('oval_id'),
+                    'tags': ['Information Sharing', 'OVAL'],
+                })
+                save = True
             if vendor.get('ref_url') not in remediation_sources:
                 remediation_sources.add(vendor.get('ref_url'))
                 cve.remediation.append({
@@ -1241,18 +1254,6 @@ def save_definition(definition :dict):
                     'contributors': definition.get('contributors', []),
                     'description': definition.get('description'),
                     'published_at': definition.get('submitted_at'),
-                })
-                save = True
-
-            if 'cve.mitre.org' in vendor.get('ref_url'):
-                continue
-            if vendor.get('ref_url') not in reference_urls:
-                reference_urls.add(vendor.get('ref_url'))
-                cve.references.append({
-                    'url': vendor.get('ref_url'),
-                    'name': vendor.get('ref_id'),
-                    'source': definition.get('oval_id'),
-                    'tags': ['Information Sharing', 'OVAL'],
                 })
                 save = True
 
@@ -1307,7 +1308,7 @@ def main(sources :list, not_before :datetime, process :bool = False):
             if definition.get('submitted_at') is not None:
                 published = datetime.fromisoformat(definition.get('submitted_at')).replace(tzinfo=None)
                 if published < not_before:
-                    logger.info(f'{published} < {not_before}')
+                    logger.debug(f'{published} < {not_before} {",".join(definition.get("cve", []))}')
                     REPORT['total'] += 1
                     REPORT['skipped'] += 1
                     continue

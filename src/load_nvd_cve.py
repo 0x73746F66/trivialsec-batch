@@ -27,6 +27,7 @@ DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2002
 DEFAULT_INDEX = 'cves'
 REPORT = {
+    'task': 'nvd-cve',
     'total': 0,
     'skipped': 0,
     'updates': 0,
@@ -135,21 +136,26 @@ def normalise_cve_item(item :dict) -> CVE:
                 continue
             cwes.add(cwe_item.get('value'))
     cve.cwe = list(cwes)
-    reference_urls = set()
-    for ref in original_cve.references:
-        reference_urls.add(ref['url'])
+
+
+    reference_urls = set([ref['url'] for ref in original_cve.references])
+    cve.references = []
+    for reference in original_cve.references:
+        if reference.get('url') not in reference_urls:
+            cve.references.append(reference)
+
     for ref in item['cve']['references']['reference_data']:
-        if 'cve.mitre.org' in ref.get('url'):
+        if 'cve.mitre.org' in ref.get('url', ''):
             continue
         if ref.get('url') not in reference_urls:
             reference_urls.add(ref.get('url'))
-            original_cve.references.append({
+            cve.references.append({
                 'url': ref.get('url'),
                 'name': ref.get('name'),
                 'source': ref.get('refsource'),
                 'tags': ref.get('tags', []),
             })
-    cve.references = original_cve.references
+
     return cve
 
 def main(start_year :int = DEFAULT_START_YEAR, not_before :datetime = datetime.utcnow(), force :bool = False):
@@ -162,7 +168,11 @@ def main(start_year :int = DEFAULT_START_YEAR, not_before :datetime = datetime.u
                 REPORT['skipped'] += 1
                 continue
             cve = normalise_cve_item(item)
-            if not cve.persist(extra={'_nvd': item}):
+            extra = {'_nvd': item}
+            doc = cve.get_doc()
+            if doc is not None:
+                extra['_xforce'] = doc.get('_source', {}).get('_xforce')
+            if not cve.persist(extra=extra):
                 logger.error(f'failed to save {cve.cve_id}')
 
         year += 1

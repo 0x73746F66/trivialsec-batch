@@ -29,6 +29,7 @@ if config.http_proxy or config.https_proxy:
         'https': f'https://{config.https_proxy}'
     }
 REPORT = {
+    'task': 'xforce-vulnerabilities',
     'total': 0,
     'skipped': 0,
     'updates': 0,
@@ -66,35 +67,48 @@ def store_cve(data :dict, xforce :dict):
     else:
         cve.assigner = 'Unknown'
         cve.description = data['description']
-    if data.get('temporal_score') is not None:
-        cve.temporal_score = data.get('temporal_score')
-        save = True
-    if data.get('title') is not None:
+
+    if cve.title is None and data.get('title') is not None:
         cve.title = data.get('title')
         save = True
+    if cve.reported_at is None and data.get('reported_at') is not None:
+        cve.reported_at = data.get('reported_at')
+        save = True
+    if cve.base_score is None and data.get('base_score') is not None:
+        cve.base_score = data.get('base_score')
+        save = True
+    if cve.temporal_score is None and data.get('temporal_score') is not None:
+        cve.temporal_score = data.get('temporal_score')
+        save = True
 
-    reference_urls = set()
-    for ref in original_cve.references or []:
-        reference_urls.add(ref['url'])
-    cve.references = original_cve.references or []
-    remediation_sources = set()
-    for remediation in original_cve.remediation or []:
-        remediation_sources.add(remediation['source_url'])
+    reference_urls = set([ref['url'] for ref in original_cve.references])
+    cve.references = []
+    for reference in original_cve.references:
+        if reference.get('url') not in reference_urls:
+            cve.references.append(reference)
 
     for reference in data['references']:
-        if 'cve.mitre.org' in reference.get('url'):
+        if 'cve.mitre.org' in reference.get('url', ''):
             continue
-        if reference.get('ref_url') not in reference_urls:
-            reference_urls.add(reference.get('ref_url'))
+        if reference.get('url') not in reference_urls:
+            reference_urls.add(reference.get('url'))
             cve.references.append(reference)
             save = True
+
+    remediation_sources = set([source['source_url'] for source in original_cve.remediation])
+    cve.remediation = []
+    for remediation in original_cve.remediation:
+        if remediation.get('source_url') not in remediation_sources:
+            cve.remediation.append(remediation)
+
     for remediation in data['remediation']:
         if remediation.get('source_url') is None:
             continue
-        if remediation.get('ref_url') not in remediation_sources:
-            remediation_sources.add(remediation.get('ref_url'))
+        if remediation.get('source_url') not in remediation_sources:
+            remediation_sources.add(remediation.get('source_url'))
             cve.remediation.append(remediation)
             save = True
+
     if data['vector'] is not None and data['cvss_version'] in ['3.0', '3.1']:
         vd = CVE.vector_to_dict(data['vector'], 3)
         if original_cve.cvss_version not in ['3.0', '3.1']:
@@ -117,15 +131,6 @@ def store_cve(data :dict, xforce :dict):
                 cve.vector = CVE.dict_to_vector(original_vd, 3)
                 cve.cvss_version = original_vd['CVSS']
                 save = True
-    if cve.reported_at is None and data.get('reported_at') is not None:
-        cve.reported_at = data.get('reported_at')
-        save = True
-    if cve.base_score is None and data.get('base_score') is not None:
-        cve.base_score = data.get('base_score')
-        save = True
-    if cve.temporal_score is None and data.get('temporal_score') is not None:
-        cve.temporal_score = data.get('temporal_score')
-        save = True
 
     logger.debug(f'Save? {save}')
     if save is True:
@@ -194,7 +199,7 @@ def parse_file_to_dict(filename :str):
                 'source_url': f"{BASE_URL}/vulnerabilities/{xforce_data['xfdbid']}",
                 'affected_packages': xforce_data.get('platforms_affected', []),
                 'contributors': [],
-                'description': xforce_data['remedy'],
+                'description': xforce_data.get('remedy', xforce_data['description']),
                 'published_at':  xforce_data['reported'].replace('Z', ''),
             })
 

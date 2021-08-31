@@ -36,6 +36,7 @@ FEEDS = {
     f'{DATAFILE_DIR}amzl2.xml': f'{BASE_URL}AL2/alas.rss'
 }
 REPORT = {
+    'task': 'amzl-alas-rss',
     'total': 0,
     'skipped': 0,
     'updates': 0,
@@ -134,14 +135,13 @@ def save_alas(data :dict):
             cve.last_modified = datetime.strptime(data['lastBuildDate'], AMZ_DATE_FORMAT).replace(tzinfo=pytz.UTC)
             save = True
 
-        reference_urls = set()
-        for ref in original_cve.references or []:
-            reference_urls.add(ref['url'])
-        remediation_sources = set()
-        for remediation in original_cve.remediation or []:
-            remediation_sources.add(remediation['source_url'])
 
-        cve.references = original_cve.references or []
+        reference_urls = set([ref['url'] for ref in original_cve.references])
+        cve.references = []
+        for reference in original_cve.references:
+            if reference.get('url') not in reference_urls:
+                cve.references.append(reference)
+
         if data['link'] not in reference_urls:
             reference_urls.add(data['link'])
             cve.references.append({
@@ -151,7 +151,13 @@ def save_alas(data :dict):
                 'tags': ['Vendor Advisory', f'AL{amz_linux_family} ALAS'],
             })
             save = True
-        cve.remediation = original_cve.remediation or []
+
+        remediation_sources = set([source['source_url'] for source in original_cve.remediation])
+        cve.remediation = []
+        for remediation in original_cve.remediation:
+            if remediation.get('source_url') not in remediation_sources:
+                cve.remediation.append(remediation)
+
         if data['link'] not in remediation_sources:
             remediation_sources.add(data['link'])
             cve.remediation.append({
