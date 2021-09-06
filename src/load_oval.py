@@ -4,8 +4,10 @@ import pathlib
 import argparse
 import os
 import xml
+import bz2
 from datetime import datetime, timedelta
 from xml.etree.ElementTree import Element, ElementTree
+import pytz
 import requests
 from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
 from elasticsearch import Elasticsearch
@@ -13,6 +15,7 @@ from retry.api import retry
 from trivialsec.helpers.config import config
 from trivialsec.models.cve import CVE
 
+from pprint import pprint
 
 logger = logging.getLogger(__name__)
 session = requests.Session()
@@ -35,7 +38,8 @@ REPORT = {
     'updates': 0,
     'new': 0,
 }
-
+DEBIAN_RELEASES = ['bullseye', 'buster', 'jessie', 'stretch', 'wheezy']
+UBUNTU_RELEASES = ['impish', 'hirsute', 'focal', 'groovy', 'bionic', 'xenial', 'trusty']
 """
 https://github.com/CISecurity/OVALRepo/blob/master/scripts/lib_oval.py
 :Usage:
@@ -766,11 +770,11 @@ class OvalElement(object):
         @return: True on success, otherwise False 
         """
         if not self or self is None:
-            return False;
+            return False
         if not self.element or self.element is None:
             return False
         if not path or path is None:
-            return False;
+            return False
         try:
             namespace = self.getNamespace()
             # Register this namespace with the parser as the default namespace
@@ -788,7 +792,7 @@ class OvalElement(object):
             return True
         
         except Exception:
-            return False;
+            return False
 
     @staticmethod
     def fromStandaloneFile(path):
@@ -1089,20 +1093,32 @@ class OvalVariable(OvalElement):
         return OvalElement.VARIABLE
 
 @retry((ConnectTimeout, ReadTimeout, ConnectionError), tries=10, delay=30, backoff=5)
-def query_raw(url :str):
+def query_raw(url :str, stream=False):
     logger.info(f'Downloading {url}')
-    resp = requests.get(url, proxies=PROXIES, headers={'user-agent': config.user_agent}, timeout=300)
+    resp = requests.get(url, proxies=PROXIES, headers={'user-agent': config.user_agent}, timeout=300, stream=stream)
     if resp.status_code != 200:
         logger.error(f'{resp.status_code} {url}')
         return None
-    return resp.text
+    return resp.content if stream is True else resp.text
 
 def definition_to_dict(definition :OvalDefinition):
     try:
         if definition.getLocalName() != 'definition' or definition.getClass() != 'patch':
             return None
         oval_id = definition.getId()
+        status = 'DRAFT'
+        submitted_at = None
+        submitted_by = None
+        cpe_refs = set()
         cpe_definitions = set()
+        cve_advisory = set()
+        contributors = set()
+        cve_refs = set()
+        patches = []
+        metadata = definition.getMetadata()
+        description = metadata.getDescription()
+        title = metadata.getTitle()
+        repository = metadata.getOvalRepositoryInformation()
         for c1 in definition.element:
             if not c1.tag.endswith('criteria'):
                 continue
@@ -1114,14 +1130,6 @@ def definition_to_dict(definition :OvalDefinition):
                         continue
                     cpe_definitions.add(c3.get('definition_ref'))
 
-        metadata = definition.getMetadata()
-        description = metadata.getDescription()
-        title = metadata.getTitle()
-        repository = metadata.getOvalRepositoryInformation()
-        contributors = set()
-        status = 'DRAFT'
-        submitted_at = None
-        submitted_by = None
         if repository is not None:
             status = repository.getStatus()
             submitted = repository.getSubmitted()
@@ -1132,13 +1140,26 @@ def definition_to_dict(definition :OvalDefinition):
             for contributor in repository.getModified().get('Contributors', []):
                 contributors.add((contributor['Contributor'], contributor['Organization']))
 
-        cve_refs = set()
-        vendors = []
+        for advisory in metadata.element:
+            if not advisory.tag.endswith('advisory'):
+                continue
+            submitted_by = advisory.get('from')
+            for elem in advisory:
+                if elem.tag.endswith('cve'):
+                    cve_advisory.add(elem.get('href'))
+                    cve_refs.add(elem.text)
+                if elem.tag.endswith('issued'):
+                    submitted_at = elem.get('date')
+                if elem.tag.endswith('affected_cpe_list'):
+                    for affected_cpe in elem:
+                        if affected_cpe.tag == 'cpe':
+                            cpe_refs.add(affected_cpe.text)
+
         for reference in metadata.element:
             if not reference.tag.endswith('reference'):
                 continue
             if reference.get('source') != 'CVE':
-                vendors.append({
+                patches.append({
                     'ref_id': reference.get('ref_id'),
                     'ref_url': derive_ref_url(reference.get('ref_id'), reference.get('ref_url')),
                 })
@@ -1153,9 +1174,11 @@ def definition_to_dict(definition :OvalDefinition):
             'submitted_by': submitted_by,
             'status': status,
             'cpe_definitions': list(cpe_definitions),
+            'cpe_refs': list(cpe_refs),
             'cve': list(cve_refs),
             'contributors': list(contributors),
-            'vendors': vendors,
+            'patches': patches,
+            'cve_advisory': list(cve_advisory),
         }
     except Exception as ex:
         for _ in map(print, definition.element.itertext()):
@@ -1173,13 +1196,20 @@ def local_oval(local_file :str):
     oval_file = pathlib.Path(local_file)
     if not oval_file.is_file():
         return None
+    # oval_file.unlink()
+    # exit(0)
     stored_tree = ElementTree()
     stored_tree.parse(local_file)
     return OvalDocument(stored_tree)
 
-def remote_oval(url :str, local_file :str) -> OvalDocument:
+def remote_oval(url :str, local_file :str):
     logger.info(url)
-    raw = query_raw(url)
+    raw = query_raw(url, url.endswith('.bz2'))
+    if raw is None:
+        return None
+    if url.endswith('.bz2'):
+        logger.info('decrompressing bz2')
+        raw = bz2.decompress(raw).decode()
     oval_file = pathlib.Path(local_file)
     oval_file.write_text(raw)
     tree = ElementTree()
@@ -1203,12 +1233,14 @@ def save_definition(definition :dict):
         cve = CVE()
         cve.cve_id = cve_id
         original_cve = CVE()
+        original_cve.cve_id = cve_id
         update = False
         save = False
         if cve.hydrate():
             update = True
-            original_cve = cve
+            original_cve.hydrate()
         else:
+            print('Unknown')
             cve.assigner = 'Unknown'
             cve.description = definition.get('description')
             cve.published_at = definition.get('submitted_at')
@@ -1220,39 +1252,52 @@ def save_definition(definition :dict):
             save = True
 
         cpes = set(original_cve.cpe or [])
-        remediation_sources = set([source['source_url'] for source in original_cve.remediation])
-        reference_urls = set([ref['url'] for ref in original_cve.references])
+        remediation_sources = set()
+        reference_urls = set()
         cve.remediation = []
         cve.references = []
         for reference in original_cve.references:
-            if reference.get('url') not in reference_urls:
+            if reference['url'] not in reference_urls:
+                reference_urls.add(reference['url'])
                 cve.references.append(reference)
         for remediation in original_cve.remediation:
             if remediation.get('source_url') not in remediation_sources:
+                remediation_sources.add(remediation.get('source_url'))
                 cve.remediation.append(remediation)
 
-        for vendor in definition['vendors']:
-            if vendor.get('ref_url') is None or 'cve.mitre.org' in vendor.get('ref_url', ''):
+        if len(definition['patches']) == 0 and len(definition['cve_advisory']) > 0:
+            for advisory_url in definition['cve_advisory']:
+                if cve.cve_id in advisory_url:
+                    definition['patches'].append({
+                        'ref_id': cve.cve_id,
+                        'ref_url': advisory_url,
+                    })
+
+        for vendor_patch in definition['patches']:
+            if vendor_patch.get('ref_url') is None or 'cve.mitre.org' in vendor_patch.get('ref_url', ''):
                 continue
-            if vendor.get('ref_url') not in reference_urls:
-                reference_urls.add(vendor.get('ref_url'))
+            if vendor_patch['ref_url'] not in reference_urls:
+                reference_urls.add(vendor_patch['ref_url'])
                 cve.references.append({
-                    'url': vendor.get('ref_url'),
-                    'name': vendor.get('ref_id'),
+                    'url': vendor_patch['ref_url'],
+                    'name': vendor_patch.get('ref_id'),
                     'source': definition.get('oval_id'),
                     'tags': ['Information Sharing', 'OVAL'],
                 })
                 save = True
-            if vendor.get('ref_url') not in remediation_sources:
-                remediation_sources.add(vendor.get('ref_url'))
+            if vendor_patch['ref_url'] not in remediation_sources:
+                remediation_sources.add(vendor_patch['ref_url'])
+                description = definition.get('description', '')
+                if 'opensuse.security' in definition.get('oval_id') and len(description) > 500:
+                    description = f'See the effected packages and description on the SUSE website: https://www.suse.com/security/cve/{cve_id}.html'
                 cve.remediation.append({
                     'type': 'patch',
                     'source': definition.get('oval_id'),
-                    'source_id': vendor.get('ref_id'),
-                    'source_url': vendor.get('ref_url'),
+                    'source_id': vendor_patch.get('ref_id'),
+                    'source_url': vendor_patch['ref_url'],
                     'affected_packages': [],
                     'contributors': definition.get('contributors', []),
-                    'description': definition.get('description'),
+                    'description': description,
                     'published_at': definition.get('submitted_at'),
                 })
                 save = True
@@ -1276,32 +1321,41 @@ def save_definition(definition :dict):
         else:
             REPORT['skipped'] += 1
 
-def main(sources :list, not_before :datetime, process :bool = False):
-    for source_file, sources_url in sources:
-        filename = f"{DATAFILE_DIR}/{source_file}"
-        stored_document = local_oval(filename)
-        document = None
-        if process is True:
-            document = stored_document
-        process = True if process is True else stored_document is None
-        if stored_document is not None:
-            stored_generator = stored_document.getGenerator()
-            stored_cis_ts = datetime.fromisoformat(stored_generator.getTimestamp().replace('T', ' '))
-            day_ago = datetime.utcnow() - timedelta(days=1)
-            if stored_cis_ts < day_ago:
-                document = remote_oval(sources_url, filename)
-                generator = document.getGenerator()
-                cis_data_ts = datetime.fromisoformat(generator.getTimestamp().replace('T', ' '))
-                if cis_data_ts > stored_cis_ts:
-                    process = True
-        if process is False:
-            logger.info('OVAL already processed')
-            return
+def retrieve_document(local_file, source_url, force_process :bool = False):
+    filename = f"{DATAFILE_DIR}/{local_file}"
+    stored_document = local_oval(filename)
+    document = None
+    if force_process is True:
+        document = stored_document
+    process = True if force_process is True else stored_document is None
+    if stored_document is not None:
+        stored_generator = stored_document.getGenerator()
+        stored_cis_ts = datetime.fromisoformat(stored_generator.getTimestamp().replace('T', ' ')).replace(tzinfo=pytz.UTC)
+        day_ago = (datetime.utcnow() - timedelta(days=1)).replace(tzinfo=pytz.UTC)
+        if stored_cis_ts < day_ago:
+            document = remote_oval(source_url, filename)
+            generator = document.getGenerator()
+            cis_data_ts = datetime.fromisoformat(generator.getTimestamp().replace('T', ' ')).replace(tzinfo=pytz.UTC)
+            if cis_data_ts > stored_cis_ts:
+                process = True
+    if process is False:
+        logger.info(f'OVAL already processed {source_url}')
+        return
+    if document is None:
+        document = remote_oval(source_url, filename)
+
+    return document
+
+def main(sources :list, not_before :datetime, force_process :bool = False):
+    for local_file, source_url in sources:
+        document = retrieve_document(local_file, source_url, force_process)
         if document is None:
-            document = remote_oval(sources_url, filename)
+            logger.info('document is None')
+            continue
         for item in document.getDefinitions():
             definition = definition_to_dict(item)
             if definition is None:
+                logger.info('definition is None')
                 REPORT['total'] += 1
                 REPORT['skipped'] += 1
                 continue
@@ -1312,8 +1366,90 @@ def main(sources :list, not_before :datetime, process :bool = False):
                     REPORT['total'] += 1
                     REPORT['skipped'] += 1
                     continue
-            definition['cpe_refs'] = cpe_from_definitions(document, definition['cpe_definitions'])
+            definition['cpe_refs'] += cpe_from_definitions(document, definition['cpe_definitions'])
             save_definition(definition)
+
+def cli_args():
+    result = {}
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
+    parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
+    parser.add_argument('--not-before', help='ISO format datetime string to skip all OVAL records published until this time', dest='not_before', default=None)
+    parser.add_argument('-f', '--force-process', help='Just process the stored file, if it exists', dest='force', action="store_true")
+    parser.add_argument('-s', '--only-show-errors', help='set logging level to ERROR (default CRITICAL)', dest='log_level_error', action="store_true")
+    parser.add_argument('-q', '--quiet', help='set logging level to WARNING (default CRITICAL)', dest='log_level_warning', action="store_true")
+    parser.add_argument('-v', '--verbose', help='set logging level to INFO (default CRITICAL)', dest='log_level_info', action="store_true")
+    parser.add_argument('-vv', '--debug', help='set logging level to DEBUG (default CRITICAL)', dest='log_level_debug', action="store_true")
+    parser.add_argument('--cis', help='Process CIS OVAL files, excludes all others unspecified', dest='include_cis', action="store_true")
+    parser.add_argument('--ubuntu', help='Process Ubuntu OVAL files, excludes all others unspecified', dest='include_ubuntu', action="store_true")
+    parser.add_argument('--redhat', help='Process Redhat OVAL files, excludes all others unspecified', dest='include_redhat', action="store_true")
+    parser.add_argument('--suse', help='Process SUSE OVAL files, excludes all others unspecified', dest='include_suse', action="store_true")
+    parser.add_argument('--debian', help='Process Debian OVAL files, excludes all others unspecified', dest='include_debian', action="store_true")
+    args = parser.parse_args()
+    if args.log_level_error:
+        result['log_level'] = logging.ERROR
+    if args.log_level_warning:
+        result['log_level'] = logging.WARNING
+    if args.log_level_info:
+        result['log_level'] = logging.INFO
+    if args.log_level_debug:
+        result['log_level'] = logging.DEBUG
+    result['index'] = args.index
+    result['force_process'] = args.force
+    result['start_year'] = int(args.year)
+    if args.not_before is not None:
+        result['not_before'] = datetime.strptime(args.not_before, DATE_FMT)
+
+    result['remote_sources'] = []
+    includes = set()
+    include_all = True
+    if args.include_cis is True:
+        includes.add('cis')
+        include_all = False
+    if args.include_ubuntu is True:
+        includes.add('ubuntu')
+        include_all = False
+    if args.include_redhat is True:
+        includes.add('redhat')
+        include_all = False
+    if args.include_suse is True:
+        includes.add('suse')
+        include_all = False
+    if args.include_debian is True:
+        includes.add('debian')
+        include_all = False
+    
+    if include_all is True or 'cis' in includes:
+        result['remote_sources'].append(('cis-oval.xml', f'https://oval.cisecurity.org/repository/download/{OVAL_SCHEMA_VERSION}/all/oval.xml'))
+    if include_all is True or 'ubuntu' in includes:
+        for code_name in UBUNTU_RELEASES:
+            result['remote_sources'].append((f'com.ubuntu-{code_name}.usn.oval.xml.bz2', f'https://security-metadata.canonical.com/oval/com.ubuntu.{code_name}.usn.oval.xml.bz2'))
+
+    if include_all is True or 'redhat' in includes:
+        year = datetime.utcnow().year
+        while year >= int(args.year):
+            result['remote_sources'].append((f'com.redhat.rhsa-{year}.xml', f'https://www.redhat.com/security/data/oval/com.redhat.rhsa-{year}.xml'))
+            year -= 1
+    if include_all is True or 'suse' in includes:
+        result['remote_sources'].extend([
+            ('suse.enterprise.server.15-patch.xml', 'https://ftp.suse.com/pub/projects/security/oval/suse.linux.enterprise.server.15-patch.xml'),
+            ('suse.enterprise.desktop.15-patch.xml', 'https://ftp.suse.com/pub/projects/security/oval/suse.linux.enterprise.desktop.15-patch.xml'),
+            ('suse.enterprise.server.12-patch.xml', 'https://ftp.suse.com/pub/projects/security/oval/suse.linux.enterprise.server.12-patch.xml'),
+            ('suse.enterprise.desktop.12-patch.xml', 'https://ftp.suse.com/pub/projects/security/oval/suse.linux.enterprise.desktop.12-patch.xml'),
+            ('suse.enterprise.server.11-patch.xml', 'https://ftp.suse.com/pub/projects/security/oval/suse.linux.enterprise.server.11-patch.xml'),
+            ('suse.enterprise.desktop.11-patch.xml', 'https://ftp.suse.com/pub/projects/security/oval/suse.linux.enterprise.desktop.11-patch.xml'),
+            ('suse.openstack.cloud.6-patch.xml', 'https://ftp.suse.com/pub/projects/security/oval/suse.openstack.cloud.6-patch.xml'),
+        ])
+    if include_all is True or 'debian' in includes:
+        for release in DEBIAN_RELEASES:
+            result['remote_sources'].append((f'oval-definitions-{release}.xml', f'https://www.debian.org/security/oval/oval-definitions-{release}.xml'))
+
+    if include_all is True:
+        REPORT['sources'] = 'all'
+    else:
+        REPORT['sources'] = ','.join(includes)
+
+    return result
 
 def report():
     end = datetime.utcnow()
@@ -1327,42 +1463,19 @@ def report():
 if __name__ == "__main__":
     start = datetime.utcnow()
     atexit.register(report)
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
-    parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
-    parser.add_argument('--not-before', help='ISO format datetime string to skip all OVAL records published until this time', dest='not_before', default=None)
-    parser.add_argument('-f', '--force-process', help='Just process the stored file, if it exists', dest='force', action="store_true")
-    parser.add_argument('-s', '--only-show-errors', help='set logging level to ERROR (default CRITICAL)', dest='log_level_error', action="store_true")
-    parser.add_argument('-q', '--quiet', help='set logging level to WARNING (default CRITICAL)', dest='log_level_warning', action="store_true")
-    parser.add_argument('-v', '--verbose', help='set logging level to INFO (default CRITICAL)', dest='log_level_info', action="store_true")
-    parser.add_argument('-vv', '--debug', help='set logging level to DEBUG (default CRITICAL)', dest='log_level_debug', action="store_true")
-    args = parser.parse_args()
-    log_level = logging.CRITICAL
-    if args.log_level_error:
-        log_level = logging.ERROR
-    if args.log_level_warning:
-        log_level = logging.WARNING
-    if args.log_level_info:
-        log_level = logging.INFO
-    if args.log_level_debug:
-        log_level = logging.DEBUG
+    arguments = cli_args()
     logging.basicConfig(
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
-        level=log_level
+        level=arguments.get('log_level', logging.CRITICAL)
     )
-    es = Elasticsearch(f"{config.elasticsearch.get('scheme')}{config.elasticsearch.get('host')}:{config.elasticsearch.get('port')}")
-    es.indices.create(index=args.index, ignore=400)
-
-    not_before = datetime(year=int(args.year), month=1 , day=1)
-    if args.not_before is not None:
-        not_before = datetime.strptime(args.not_before, DATE_FMT)
-
-    remote_sources = [
-        ('cis.xml', f'https://oval.cisecurity.org/repository/download/{OVAL_SCHEMA_VERSION}/all/oval.xml'),
-    ]
-    year = datetime.utcnow().year
-    while year >= int(args.year):
-        remote_sources.append((f'com.redhat.rhsa-{year}.xml', f'https://www.redhat.com/security/data/oval/com.redhat.rhsa-{year}.xml'))
-        year -= 1
-
-    main(remote_sources, not_before, process=args.force)
+    es = Elasticsearch(
+        config.elasticsearch.get('hosts'),
+        http_auth=(config.elasticsearch.get('user'), config.elasticsearch_password),
+        scheme=config.elasticsearch.get('scheme'),
+        port=config.elasticsearch.get('port'),
+    )
+    es.indices.create(index=arguments.get('index', DEFAULT_INDEX), ignore=400)
+    not_before = datetime(year=arguments.get('start_year', DEFAULT_START_YEAR), month=1 , day=1)
+    if isinstance(arguments.get('not_before'), datetime):
+        not_before = arguments['not_before']
+    main(arguments['remote_sources'], not_before, force_process=bool(arguments['force_process']))

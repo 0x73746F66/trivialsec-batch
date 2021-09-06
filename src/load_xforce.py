@@ -17,7 +17,7 @@ from trivialsec.helpers.config import config
 session = requests.Session()
 logger = logging.getLogger(__name__)
 BASE_URL = 'https://exchange.xforce.ibmcloud.com'
-DATAFILE_DIR = '/var/cache/trivialsec'
+DATAFILE_DIR = '/var/cache/trivialsec/xforce'
 DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2002
 DEFAULT_INDEX = 'cves'
@@ -58,13 +58,13 @@ def store_cve(data :dict, xforce :dict):
     REPORT['total'] += 1
     update = False
     save = False
-    cve = CVE()
-    cve.cve_id = data['cve_id']
-    original_cve = CVE()
+    cve = CVE(cve_id=data['cve_id'])
+    original_cve = CVE(cve_id=cve.cve_id)
     if cve.hydrate():
         update = True
-        original_cve = cve
+        original_cve.hydrate()
     else:
+        logger.warning(f'Official {cve.cve_id} missing from our Database')
         cve.assigner = 'Unknown'
         cve.description = data['description']
 
@@ -81,10 +81,11 @@ def store_cve(data :dict, xforce :dict):
         cve.temporal_score = data.get('temporal_score')
         save = True
 
-    reference_urls = set([ref['url'] for ref in original_cve.references])
+    reference_urls = set()
     cve.references = []
     for reference in original_cve.references:
         if reference.get('url') not in reference_urls:
+            reference_urls.add(reference.get('url'))
             cve.references.append(reference)
 
     for reference in data['references']:
@@ -95,10 +96,11 @@ def store_cve(data :dict, xforce :dict):
             cve.references.append(reference)
             save = True
 
-    remediation_sources = set([source['source_url'] for source in original_cve.remediation])
+    remediation_sources = set()
     cve.remediation = []
     for remediation in original_cve.remediation:
         if remediation.get('source_url') not in remediation_sources:
+            remediation_sources.add(remediation.get('source_url'))
             cve.remediation.append(remediation)
 
     for remediation in data['remediation']:
@@ -132,7 +134,6 @@ def store_cve(data :dict, xforce :dict):
                 cve.cvss_version = original_vd['CVSS']
                 save = True
 
-    logger.debug(f'Save? {save}')
     if save is True:
         REPORT['new' if update is False else 'updates'] += 1
         extra = None
@@ -330,7 +331,7 @@ def query_latest(limit :int = 200):
 def do_latest(limit :int = 200):
     for item in query_latest(limit):
         original_data = {}
-        datafile_path = f"{DATAFILE_DIR}/{item['xfdbid']}.json"
+        datafile_path = f"{DATAFILE_DIR}-{item['xfdbid']}.json"
         xforce_file = pathlib.Path(datafile_path)
         if xforce_file.is_file():
             original_data = json.loads(xforce_file.read_text())
@@ -366,7 +367,7 @@ def do_bulk(start :datetime, end :datetime) -> bool:
     if total_rows <= 200:
         rows = resp.get('rows', [])
     for item in rows:
-        datafile = f"{DATAFILE_DIR}/{item['xfdbid']}.json"
+        datafile = f"{DATAFILE_DIR}-{item['xfdbid']}.json"
         original_data = {}
         xforce_file = pathlib.Path(datafile)
         if xforce_file.is_file():
@@ -428,9 +429,13 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=log_level
     )
-    es = Elasticsearch(f"{config.elasticsearch.get('scheme')}{config.elasticsearch.get('host')}:{config.elasticsearch.get('port')}")
+    es = Elasticsearch(
+        config.elasticsearch.get('hosts'),
+        http_auth=(config.elasticsearch.get('user'), config.elasticsearch_password),
+        scheme=config.elasticsearch.get('scheme'),
+        port=config.elasticsearch.get('port'),
+    )
     es.indices.create(index=args.index, ignore=400)
-
     start_year=DEFAULT_START_YEAR if args.since_year is None else int(args.since_year)
     not_before = datetime(year=start_year, month=1 , day=1)
     if args.not_before is not None:

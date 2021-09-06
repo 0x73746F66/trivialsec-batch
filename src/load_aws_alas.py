@@ -121,13 +121,13 @@ def save_alas(data :dict):
             REPORT['skipped'] += 1
             continue
         save = False
-        cve = CVE()
-        cve.cve_id = cve_ref
-        original_cve = CVE()
+        cve = CVE(cve_id=cve_ref)
+        original_cve = CVE(cve_id=cve.cve_id)
         if cve.hydrate():
             update = True
-            original_cve = cve
+            original_cve.hydrate()
         else:
+            logger.warning(f'Official {cve_ref} missing from our Database')
             cve.assigner = 'Unknown'
             cve.title = data["title"]
             cve.description = f'{source}\n{data.get("issue_overview", "")}'.strip()
@@ -136,10 +136,11 @@ def save_alas(data :dict):
             save = True
 
 
-        reference_urls = set([ref['url'] for ref in original_cve.references])
+        reference_urls = set()
         cve.references = []
         for reference in original_cve.references:
             if reference.get('url') not in reference_urls:
+                reference_urls.add(reference.get('url'))
                 cve.references.append(reference)
 
         if data['link'] not in reference_urls:
@@ -152,10 +153,11 @@ def save_alas(data :dict):
             })
             save = True
 
-        remediation_sources = set([source['source_url'] for source in original_cve.remediation])
+        remediation_sources = set()
         cve.remediation = []
         for remediation in original_cve.remediation:
             if remediation.get('source_url') not in remediation_sources:
+                remediation_sources.add(remediation.get('source_url'))
                 cve.remediation.append(remediation)
 
         if data['link'] not in remediation_sources:
@@ -238,9 +240,13 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=log_level
     )
-    es = Elasticsearch(f"{config.elasticsearch.get('scheme')}{config.elasticsearch.get('host')}:{config.elasticsearch.get('port')}")
+    es = Elasticsearch(
+        config.elasticsearch.get('hosts'),
+        http_auth=(config.elasticsearch.get('user'), config.elasticsearch_password),
+        scheme=config.elasticsearch.get('scheme'),
+        port=config.elasticsearch.get('port'),
+    )
     es.indices.create(index=args.index, ignore=400)
-
     not_before = datetime(year=int(args.year), month=1 , day=1)
     if args.not_before is not None:
         not_before = datetime.strptime(args.not_before, AMZ_DATE_FMT)

@@ -6,6 +6,8 @@ import urllib.request
 import logging
 import pathlib
 import requests
+from retry.api import retry
+from urllib.error import HTTPError
 from datetime import datetime, timedelta
 from elasticsearch import Elasticsearch
 from trivialsec.models.cve import CVE
@@ -32,33 +34,24 @@ REPORT = {
     'skipped': 0,
     'updates': 0,
     'new': 0,
+    'latest': False,
+    'modified': False,
 }
 
-def download_gzip(url, out_file):
-    try:
-        with urllib.request.urlopen(url) as response:
+@retry((HTTPError, EOFError), tries=5, delay=1.5, backoff=3)
+def get_cve_from_nvd(feed_type, force :bool = False):
+    json_gz_url = f'{BASE_URL}/feeds/json/cve/1.1/nvdcve-1.1-{feed_type}.json.gz'
+    json_file_path = f'{DATAFILE_DIR}/nvdcve-1.1-{feed_type}.json'
+    json_file = pathlib.Path(json_file_path)
+    if force is True or not json_file.is_file():
+        logger.info(json_gz_url)
+        with urllib.request.urlopen(json_gz_url) as response:
             with gzip.GzipFile(fileobj=response) as uncompressed:
                 file_content = uncompressed.read()
-        with open(out_file, 'wb') as f:
-            f.write(file_content)
-            return True
-
-    except Exception as e:
-        logger.exception(e)
-
-    return False
-
-def cve_items_by_year(year :int):
-    json_gz_url = f'{BASE_URL}/feeds/json/cve/1.1/nvdcve-1.1-{year}.json.gz'
-    json_file_path = f'{DATAFILE_DIR}/nvdcve-1.1-{year}.json'
-    json_file = pathlib.Path(json_file_path)
-    if not json_file.is_file():
-        logger.info(json_gz_url)
-        if not download_gzip(json_gz_url, json_file_path):
-            logger.info(f'Failed to save {json_file_path}')
+        json_file.write_text(file_content.decode())
     if not json_file.is_file():
         logger.info('failed to read json file')
-        return False
+        return None
     data = json.loads(json_file.read_text())
     for item in data['CVE_Items']:
         yield item
@@ -67,9 +60,10 @@ def normalise_cve_item(item :dict) -> CVE:
     cve = CVE()
     cve.cve_id = item['cve']['CVE_data_meta']['ID']
     original_cve = CVE()
+    original_cve.cve_id = cve.cve_id
     if cve.hydrate():
         REPORT['updates'] += 1
-        original_cve = cve
+        original_cve.hydrate()
     else:
         REPORT['new'] += 1
 
@@ -136,12 +130,11 @@ def normalise_cve_item(item :dict) -> CVE:
                 continue
             cwes.add(cwe_item.get('value'))
     cve.cwe = list(cwes)
-
-
-    reference_urls = set([ref['url'] for ref in original_cve.references])
+    reference_urls = set()
     cve.references = []
     for reference in original_cve.references:
         if reference.get('url') not in reference_urls:
+            reference_urls.add(reference.get('url'))
             cve.references.append(reference)
 
     for ref in item['cve']['references']['reference_data']:
@@ -158,10 +151,42 @@ def normalise_cve_item(item :dict) -> CVE:
 
     return cve
 
+def do_modified(not_before :datetime = datetime.utcnow(), force :bool = False):
+    for item in get_cve_from_nvd('modified', True):
+        if item is None:
+            break
+        REPORT['total'] += 1
+        last_modified = datetime.strptime(item['lastModifiedDate'], DATE_FMT)
+        if force is False and last_modified < not_before:
+            REPORT['skipped'] += 1
+            continue
+        cve = normalise_cve_item(item)
+        extra = {'_nvd': item}
+        doc = cve.get_doc()
+        if doc is not None:
+            extra['_xforce'] = doc.get('_source', {}).get('_xforce')
+        if not cve.persist(extra=extra):
+            logger.error(f'failed to save {cve.cve_id}')
+
+def do_latest():
+    for item in get_cve_from_nvd('recent', True):
+        if item is None:
+            break
+        REPORT['total'] += 1
+        cve = normalise_cve_item(item)
+        extra = {'_nvd': item}
+        doc = cve.get_doc()
+        if doc is not None:
+            extra['_xforce'] = doc.get('_source', {}).get('_xforce')
+        if not cve.persist(extra=extra):
+            logger.error(f'failed to save {cve.cve_id}')
+
 def main(start_year :int = DEFAULT_START_YEAR, not_before :datetime = datetime.utcnow(), force :bool = False):
     year = start_year or DEFAULT_START_YEAR
     while year <= datetime.utcnow().year:
-        for item in cve_items_by_year(year):
+        for item in get_cve_from_nvd(year, force):
+            if item is None:
+                break
             REPORT['total'] += 1
             published = datetime.strptime(item['publishedDate'], DATE_FMT)
             if force is False and published < not_before:
@@ -194,6 +219,8 @@ if __name__ == "__main__":
     parser.add_argument('-y', '--year', help='CVE files are sorted by year, optionally specify a single year', dest='year', default=None)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all CVE records published until this time', dest='not_before', default=None)
     parser.add_argument('-f', '--force-process', help='Force processing all records', dest='force', action="store_true")
+    parser.add_argument('-l', '--latest', help='Process the latest feed published by NVD', dest='latest', action="store_true")
+    parser.add_argument('-m', '--modified', help='Process the modified feed published by NVD', dest='modified', action="store_true")
     parser.add_argument('-s', '--only-show-errors', help='set logging level to ERROR (default CRITICAL)', dest='log_level_error', action="store_true")
     parser.add_argument('-q', '--quiet', help='set logging level to WARNING (default CRITICAL)', dest='log_level_warning', action="store_true")
     parser.add_argument('-v', '--verbose', help='set logging level to INFO (default CRITICAL)', dest='log_level_info', action="store_true")
@@ -212,11 +239,22 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=log_level
     )
-    es = Elasticsearch(f"{config.elasticsearch.get('scheme')}{config.elasticsearch.get('host')}:{config.elasticsearch.get('port')}")
+    es = Elasticsearch(
+        config.elasticsearch.get('hosts'),
+        http_auth=(config.elasticsearch.get('user'), config.elasticsearch_password),
+        scheme=config.elasticsearch.get('scheme'),
+        port=config.elasticsearch.get('port'),
+    )
     es.indices.create(index=args.index, ignore=400)
-
     start_year=DEFAULT_START_YEAR if args.year is None else int(args.year)
     not_before = datetime(year=start_year, month=1 , day=1)
     if args.not_before is not None:
         not_before = datetime.strptime(args.not_before, DATE_FMT)
-    main(start_year=start_year, not_before=not_before, force=args.force)
+    if args.latest is True:
+        do_latest()
+        REPORT['latest'] = True
+    else:
+        main(start_year=start_year, not_before=not_before, force=args.force)
+    if args.modified is True:
+        do_modified(not_before, force=args.force)
+        REPORT['modified'] = True
