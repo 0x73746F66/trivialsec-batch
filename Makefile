@@ -17,26 +17,32 @@ prep: ## Cleanup tmp files
 	@find . -type f -name '*.pyc' -delete 2>/dev/null
 	@find . -type d -name '__pycache__' -delete 2>/dev/null
 	@find . -type f -name '*.DS_Store' -delete 2>/dev/null
-	@rm -rf python-libs
+	@rm -rf python-libs 2>/dev/null
 
 python-libs: prep ## download and install the trivialsec python libs locally (for IDE completions)
 	yes | pip uninstall -q trivialsec-common
 	@$(shell rm -rf python-libs; git clone -q -c advice.detachedHead=false --depth 1 --branch ${COMMON_VERSION} --single-branch https://${DOCKER_USER}:${DOCKER_PASSWORD}@gitlab.com/trivialsec/python-common.git python-libs)
 	cd python-libs
 	make install
+	@rm -rf python-libs
 
-install-deps: python-libs ## Just the minimal local deps for IDE completions
+setup: ## first time local setup activities
+	@echo $(docker --version)
+	@echo $(docker-compose --version)
+	@pip --version
+	@echo node $(node --version)
+	@echo yarn $(yarn --version)
+	docker volume create --name=scheduler-cache
 	pip install -q -U pip setuptools wheel semgrep pylint
 	pip install -q -U --no-cache-dir --find-links=python-libs/build/wheel --no-index --isolated -r requirements.txt
 
-setup:
-	docker volume create --name=scheduler-cache
-
-test-local: ## Prettier test outputs
+test-local: ## Prettier test outputs for local dev
+	@echo semgrep $(semgrep --version)
 	pylint --exit-zero -f colorized --persistent=y -r y --jobs=0 src/**/*.py
 	semgrep -q --strict --timeout=0 --config=p/r2c-ci --lang=py src/**/*.py
 
 pylint-ci: ## run pylint for CI
+	@pylint --version
 	pylint --exit-zero --persistent=n -f json -r n --jobs=0 --errors-only src/**/*.py > pylint.json
 
 semgrep-sast-ci: ## run core semgrep rules for CI
