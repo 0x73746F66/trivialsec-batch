@@ -12,12 +12,14 @@ from retry.api import retry
 from bs4 import BeautifulSoup as bs
 from elasticsearch import Elasticsearch
 from trivialsec.models.cve import CVE
+from trivialsec.helpers.elasticsearch_adapter import Indexes
 from trivialsec.helpers.config import config
 
 
 session = requests.Session()
 logger = logging.getLogger(__name__)
 PROXIES = None
+Indexes.create()
 if config.http_proxy or config.https_proxy:
     PROXIES = {
         'http': f'http://{config.http_proxy}',
@@ -30,7 +32,7 @@ DATAFILE_DIR = '/var/cache/trivialsec/'
 ALAS_PATTERN = r"(ALAS\-\d{4}\-\d*)"
 AMZ_DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2011
-DEFAULT_INDEX = 'cves'
+DEFAULT_INDEX = Indexes.cves
 FEEDS = {
     f'{DATAFILE_DIR}amzl1.xml': f'{BASE_URL}alas.rss',
     f'{DATAFILE_DIR}amzl2.xml': f'{BASE_URL}AL2/alas.rss'
@@ -246,7 +248,6 @@ if __name__ == "__main__":
         scheme=config.elasticsearch.get('scheme'),
         port=config.elasticsearch.get('port'),
     )
-    es.indices.create(index=args.index, ignore=400)
     not_before = datetime(year=int(args.year), month=1 , day=1)
     if args.not_before is not None:
         not_before = datetime.strptime(args.not_before, AMZ_DATE_FMT)

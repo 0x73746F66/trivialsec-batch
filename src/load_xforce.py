@@ -12,6 +12,7 @@ from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
 from elasticsearch import Elasticsearch
 from trivialsec.models.cve import CVE
 from trivialsec.helpers.config import config
+from trivialsec.helpers.elasticsearch_adapter import Indexes
 
 
 session = requests.Session()
@@ -20,9 +21,10 @@ BASE_URL = 'https://exchange.xforce.ibmcloud.com'
 DATAFILE_DIR = '/var/cache/trivialsec/xforce'
 DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2002
-DEFAULT_INDEX = 'cves'
+DEFAULT_INDEX = Indexes.cves
 PROXIES = None
 SOURCE = 'IBM X-Force Exchange'
+Indexes.create()
 if config.http_proxy or config.https_proxy:
     PROXIES = {
         'http': f'http://{config.http_proxy}',
@@ -54,6 +56,7 @@ v2_0 = {
         'Confirmed': 'RC:C',
     }
 }
+
 def store_cve(data :dict, xforce :dict):
     REPORT['total'] += 1
     update = False
@@ -435,7 +438,6 @@ if __name__ == "__main__":
         scheme=config.elasticsearch.get('scheme'),
         port=config.elasticsearch.get('port'),
     )
-    es.indices.create(index=args.index, ignore=400)
     start_year=DEFAULT_START_YEAR if args.since_year is None else int(args.since_year)
     not_before = datetime(year=start_year, month=1 , day=1)
     if args.not_before is not None:

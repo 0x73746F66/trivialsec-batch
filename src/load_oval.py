@@ -13,9 +13,9 @@ from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
 from elasticsearch import Elasticsearch
 from retry.api import retry
 from trivialsec.helpers.config import config
+from trivialsec.helpers.elasticsearch_adapter import Indexes
 from trivialsec.models.cve import CVE
 
-from pprint import pprint
 
 logger = logging.getLogger(__name__)
 session = requests.Session()
@@ -24,8 +24,9 @@ DATAFILE_DIR = '/var/cache/trivialsec'
 CVE_PATTERN = r"(CVE\-\d{4}\-\d*)"
 DATE_FMT = "%Y-%m-%dT%H:%M:%S"
 DEFAULT_START_YEAR = 2005
-DEFAULT_INDEX = 'cves'
+DEFAULT_INDEX = Indexes.cves
 PROXIES = None
+Indexes.create()
 if config.http_proxy or config.https_proxy:
     PROXIES = {
         'http': f'http://{config.http_proxy}',
@@ -1474,7 +1475,6 @@ if __name__ == "__main__":
         scheme=config.elasticsearch.get('scheme'),
         port=config.elasticsearch.get('port'),
     )
-    es.indices.create(index=arguments.get('index', DEFAULT_INDEX), ignore=400)
     not_before = datetime(year=arguments.get('start_year', DEFAULT_START_YEAR), month=1 , day=1)
     if isinstance(arguments.get('not_before'), datetime):
         not_before = arguments['not_before']
