@@ -10,28 +10,24 @@ from xml.etree.ElementTree import Element, ElementTree
 import pytz
 import requests
 from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
-from elasticsearch import Elasticsearch
 from retry.api import retry
-from trivialsec.helpers.config import config
-from trivialsec.helpers.elasticsearch_adapter import Indexes
 from trivialsec.models.cve import CVE
+from trivialsec.helpers.config import config
 
 
 logger = logging.getLogger(__name__)
 session = requests.Session()
-OVAL_SCHEMA_VERSION = '5.11.2'
-DATAFILE_DIR = '/var/cache/trivialsec'
-CVE_PATTERN = r"(CVE\-\d{4}\-\d*)"
-DATE_FMT = "%Y-%m-%dT%H:%M:%S"
-DEFAULT_START_YEAR = 2005
-DEFAULT_INDEX = Indexes.cves
 PROXIES = None
-Indexes.create()
 if config.http_proxy or config.https_proxy:
     PROXIES = {
         'http': f'http://{config.http_proxy}',
         'https': f'https://{config.https_proxy}'
     }
+OVAL_SCHEMA_VERSION = '5.11.2'
+DATAFILE_DIR = '/var/cache/trivialsec'
+CVE_PATTERN = r"(CVE\-\d{4}\-\d*)"
+DATE_FMT = "%Y-%m-%dT%H:%M:%S"
+DEFAULT_START_YEAR = 2005
 REPORT = {
     'task': 'oval-patches',
     'total': 0,
@@ -1373,7 +1369,6 @@ def main(sources :list, not_before :datetime, force_process :bool = False):
 def cli_args():
     result = {}
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
     parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all OVAL records published until this time', dest='not_before', default=None)
     parser.add_argument('-f', '--force-process', help='Just process the stored file, if it exists', dest='force', action="store_true")
@@ -1395,7 +1390,7 @@ def cli_args():
         result['log_level'] = logging.INFO
     if args.log_level_debug:
         result['log_level'] = logging.DEBUG
-    result['index'] = args.index
+
     result['force_process'] = args.force
     result['start_year'] = int(args.year)
     if args.not_before is not None:
@@ -1461,21 +1456,18 @@ def report():
     REPORT['elapsed'] = str(timedelta(seconds=elapsed))
     print(repr(REPORT))
 
-if __name__ == "__main__":
-    start = datetime.utcnow()
-    atexit.register(report)
+def run():
     arguments = cli_args()
     logging.basicConfig(
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=arguments.get('log_level', logging.CRITICAL)
     )
-    es = Elasticsearch(
-        config.elasticsearch.get('hosts'),
-        http_auth=(config.elasticsearch.get('user'), config.elasticsearch_password),
-        scheme=config.elasticsearch.get('scheme'),
-        port=config.elasticsearch.get('port'),
-    )
     not_before = datetime(year=arguments.get('start_year', DEFAULT_START_YEAR), month=1 , day=1)
     if isinstance(arguments.get('not_before'), datetime):
         not_before = arguments['not_before']
     main(arguments['remote_sources'], not_before, force_process=bool(arguments['force_process']))
+
+if __name__ == "__main__":
+    start = datetime.utcnow()
+    atexit.register(report)
+    run()

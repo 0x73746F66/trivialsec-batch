@@ -5,20 +5,17 @@ import argparse
 import urllib.request
 import logging
 import pathlib
-import requests
-from retry.api import retry
 from urllib.error import HTTPError
 from datetime import datetime, timedelta
-from elasticsearch import Elasticsearch
+import requests
+from retry.api import retry
 from trivialsec.models.cve import CVE
-from trivialsec.helpers.elasticsearch_adapter import Indexes
 from trivialsec.helpers.config import config
 
 
 session = requests.Session()
 logger = logging.getLogger(__name__)
 PROXIES = None
-Indexes.create()
 if config.http_proxy or config.https_proxy:
     PROXIES = {
         'http': f'http://{config.http_proxy}',
@@ -29,7 +26,6 @@ BASE_URL = 'https://nvd.nist.gov'
 DATAFILE_DIR = '/var/cache/trivialsec'
 DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2002
-DEFAULT_INDEX = Indexes.cves
 REPORT = {
     'task': 'nvd-cve',
     'total': 0,
@@ -213,11 +209,8 @@ def report():
     REPORT['elapsed'] = str(timedelta(seconds=elapsed))
     print(repr(REPORT))
 
-if __name__ == "__main__":
-    start = datetime.utcnow()
-    atexit.register(report)
+def run():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
     parser.add_argument('-y', '--year', help='CVE files are sorted by year, optionally specify a single year', dest='year', default=None)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all CVE records published until this time', dest='not_before', default=None)
     parser.add_argument('-f', '--force-process', help='Force processing all records', dest='force', action="store_true")
@@ -241,12 +234,6 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=log_level
     )
-    es = Elasticsearch(
-        config.elasticsearch.get('hosts'),
-        http_auth=(config.elasticsearch.get('user'), config.elasticsearch_password),
-        scheme=config.elasticsearch.get('scheme'),
-        port=config.elasticsearch.get('port'),
-    )
     start_year=DEFAULT_START_YEAR if args.year is None else int(args.year)
     not_before = datetime(year=start_year, month=1 , day=1)
     if args.not_before is not None:
@@ -259,3 +246,8 @@ if __name__ == "__main__":
     if args.modified is True:
         do_modified(not_before, force=args.force)
         REPORT['modified'] = True
+
+if __name__ == "__main__":
+    start = datetime.utcnow()
+    atexit.register(report)
+    run()

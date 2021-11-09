@@ -3,23 +3,20 @@ import re
 import logging
 import argparse
 import pathlib
-import requests
-import pytz
 from xml.etree.ElementTree import Element, ElementTree
 from datetime import datetime, timedelta
-from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
+import pytz
+import requests
+from requests.exceptions import ConnectTimeout, ReadTimeout
 from retry.api import retry
 from bs4 import BeautifulSoup as bs
-from elasticsearch import Elasticsearch
 from trivialsec.models.cve import CVE
-from trivialsec.helpers.elasticsearch_adapter import Indexes
 from trivialsec.helpers.config import config
 
 
-session = requests.Session()
 logger = logging.getLogger(__name__)
+session = requests.Session()
 PROXIES = None
-Indexes.create()
 if config.http_proxy or config.https_proxy:
     PROXIES = {
         'http': f'http://{config.http_proxy}',
@@ -32,7 +29,6 @@ DATAFILE_DIR = '/var/cache/trivialsec/'
 ALAS_PATTERN = r"(ALAS\-\d{4}\-\d*)"
 AMZ_DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2011
-DEFAULT_INDEX = Indexes.cves
 FEEDS = {
     f'{DATAFILE_DIR}amzl1.xml': f'{BASE_URL}alas.rss',
     f'{DATAFILE_DIR}amzl2.xml': f'{BASE_URL}AL2/alas.rss'
@@ -216,11 +212,8 @@ def report():
     REPORT['elapsed'] = str(timedelta(seconds=elapsed))
     print(repr(REPORT))
 
-if __name__ == "__main__":
-    start = datetime.utcnow()
-    atexit.register(report)
+def run():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
     parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='year', default=DEFAULT_START_YEAR)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all RSS records published until this time', dest='not_before', default=None)
     parser.add_argument('-f', '--force-process', help='Force processing all records', dest='force', action="store_true")
@@ -242,14 +235,12 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=log_level
     )
-    es = Elasticsearch(
-        config.elasticsearch.get('hosts'),
-        http_auth=(config.elasticsearch.get('user'), config.elasticsearch_password),
-        scheme=config.elasticsearch.get('scheme'),
-        port=config.elasticsearch.get('port'),
-    )
     not_before = datetime(year=int(args.year), month=1 , day=1)
     if args.not_before is not None:
         not_before = datetime.strptime(args.not_before, AMZ_DATE_FMT)
-
     main(not_before, force=args.force)
+
+if __name__ == "__main__":
+    start = datetime.utcnow()
+    atexit.register(report)
+    run()

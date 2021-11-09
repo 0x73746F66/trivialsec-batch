@@ -9,10 +9,8 @@ from datetime import datetime, timedelta
 import requests
 from retry.api import retry
 from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
-from elasticsearch import Elasticsearch
 from trivialsec.models.cve import CVE
 from trivialsec.helpers.config import config
-from trivialsec.helpers.elasticsearch_adapter import Indexes
 
 
 session = requests.Session()
@@ -21,10 +19,8 @@ BASE_URL = 'https://exchange.xforce.ibmcloud.com'
 DATAFILE_DIR = '/var/cache/trivialsec/xforce'
 DATE_FMT = "%Y-%m-%dT%H:%MZ"
 DEFAULT_START_YEAR = 2002
-DEFAULT_INDEX = Indexes.cves
-PROXIES = None
 SOURCE = 'IBM X-Force Exchange'
-Indexes.create()
+PROXIES = None
 if config.http_proxy or config.https_proxy:
     PROXIES = {
         'http': f'http://{config.http_proxy}',
@@ -409,7 +405,6 @@ if __name__ == "__main__":
     start = datetime.utcnow()
     atexit.register(report)
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--index', help='Elasticsearch index', dest='index', default=DEFAULT_INDEX)
     parser.add_argument('-y', '--since-year', help='optionally specify a year to start from', dest='since_year', default=DEFAULT_START_YEAR)
     parser.add_argument('--not-before', help='ISO format datetime string to skip all records published until this time', dest='not_before', default=None)
     parser.add_argument('-r', '--recent', help='Process the latest 1-200 max published records (default 200) change limit using "--recent-limit"', dest='process_latest', action="store_true")
@@ -431,12 +426,6 @@ if __name__ == "__main__":
     logging.basicConfig(
         format='%(asctime)s - %(name)s - [%(levelname)s] %(message)s',
         level=log_level
-    )
-    es = Elasticsearch(
-        config.elasticsearch.get('hosts'),
-        http_auth=(config.elasticsearch.get('user'), config.elasticsearch_password),
-        scheme=config.elasticsearch.get('scheme'),
-        port=config.elasticsearch.get('port'),
     )
     start_year=DEFAULT_START_YEAR if args.since_year is None else int(args.since_year)
     not_before = datetime(year=start_year, month=1 , day=1)

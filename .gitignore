@@ -1,5 +1,5 @@
 .vscode/
 .env
-.history/
+.lh/
 .venv/
 python-libs/
