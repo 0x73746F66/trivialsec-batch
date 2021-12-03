@@ -41,7 +41,12 @@ RUN python3 -m pip install -q --no-cache-dir --no-warn-script-location -U pip 2>
     && make install \
     && cd /srv/app \
     && echo "Clean up..." \
-    && rm -rf /tmp/python-libs
+    && rm -rf /tmp/python-libs \
+# forward request and error logs to docker log collector
+    && touch /var/log/trivialsec/cron.log \
+    && touch /var/log/trivialsec/cron-error.log \
+    && ln -sf /dev/stdout /var/log/trivialsec/cron.log \
+    && ln -sf /dev/stderr /var/log/trivialsec/cron-error.log
 
 COPY --chown=trivialsec:trivialsec *.env .
 COPY --chown=trivialsec:trivialsec src src
