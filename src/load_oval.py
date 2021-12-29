@@ -1226,6 +1226,8 @@ def cpe_from_definitions(document :OvalDocument, definitions :list):
 
 def save_definition(definition :dict):
     for cve_id in definition.get('cve', []):
+        if not cve_id:
+            continue
         REPORT['total'] += 1
         cve = CVE()
         cve.cve_id = cve_id
@@ -1237,13 +1239,13 @@ def save_definition(definition :dict):
             update = True
             original_cve.hydrate()
         else:
-            print('Unknown')
             cve.assigner = 'Unknown'
             cve.description = definition.get('description')
             cve.published_at = definition.get('submitted_at')
             cve.last_modified = datetime.utcnow()
             save = True
 
+        cve.cve_id = cve_id
         if cve.title is None:
             cve.title = definition.get('title')
             save = True
@@ -1331,6 +1333,8 @@ def retrieve_document(local_file, source_url, force_process :bool = False):
         day_ago = (datetime.utcnow() - timedelta(days=1)).replace(tzinfo=pytz.UTC)
         if stored_cis_ts < day_ago:
             document = remote_oval(source_url, filename)
+            if document is None:
+                return None
             generator = document.getGenerator()
             cis_data_ts = datetime.fromisoformat(generator.getTimestamp().replace('T', ' ')).replace(tzinfo=pytz.UTC)
             if cis_data_ts > stored_cis_ts:

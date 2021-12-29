@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -m
+set -e
+
+(
+
+echo "[$(date)] $(id -anu) started executing $(basename $2)"
+runuser -u trivialsec -- $@ 2>>/var/log/trivialsec/error.log | tee -a /var/log/trivialsec/$(basename $2).log /var/log/trivialsec/tasks.log
+echo "[$(date)] Exit $? $(basename $2)"
+
+) 2>&1 >>/var/log/trivialsec/task-runner.log

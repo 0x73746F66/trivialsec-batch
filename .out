@@ -2,4 +2,12 @@
 if [ "$(which deactivate)" != "deactivate not found" ]; then
   deactivate
 fi
+unset LOG_LEVEL
+unset BUILD_ENV
+unset IMAGE_TAG
+unset TF_VAR_allowed_linode_username
+unset TF_VAR_public_key
+unset TF_VAR_trivialsec_py_lib_ver
+unset TF_VAR_gitlab_user
+unset TF_VAR_gitlab_password
 reset

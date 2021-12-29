@@ -169,20 +169,12 @@ def parse_file_to_dict(filename :str):
                 'references': [],
                 'remediation': [],
             }
-            if xforce_data['cvss']['version'] == '2.0':
-                vd = CVE.vector_to_dict(xforce_data['cvss_vector'], 2)
-                data['vector'] = CVE.dict_to_vector(vd, 2)
-                data['cvss_version'] = vd.get('CVSS', xforce_data['cvss']['version'])
-            if xforce_data['cvss']['version'] in ['3.0', '3.1']:
-                vd = CVE.vector_to_dict(xforce_data['cvss_vector'], 3)
-                data['vector'] = CVE.dict_to_vector(vd, 3)
-                data['cvss_version'] = vd.get('CVSS', xforce_data['cvss']['version'])
 
-            data['base_score'] = xforce_data['risk_level']
+            data['base_score'] = xforce_data.get('risk_level')
             data['temporal_score'] = xforce_data.get('temporal_score')
             data['reported_at'] = xforce_data['reported'].replace('Z', '')
 
-            for ref in xforce_data['references']:
+            for ref in xforce_data.get('references', []):
                 if 'cve.mitre.org' in ref['link_target']:
                     continue
                 data['references'].append({
@@ -202,6 +194,15 @@ def parse_file_to_dict(filename :str):
                 'description': xforce_data.get('remedy', xforce_data['description']),
                 'published_at':  xforce_data['reported'].replace('Z', ''),
             })
+            if xforce_data.get('cvss'):
+                if xforce_data['cvss']['version'] == '2.0':
+                    vd = CVE.vector_to_dict(xforce_data['cvss_vector'], 2)
+                    data['vector'] = CVE.dict_to_vector(vd, 2)
+                    data['cvss_version'] = vd.get('CVSS', xforce_data['cvss']['version'])
+                if xforce_data['cvss']['version'] in ['3.0', '3.1']:
+                    vd = CVE.vector_to_dict(xforce_data['cvss_vector'], 3)
+                    data['vector'] = CVE.dict_to_vector(vd, 3)
+                    data['cvss_version'] = vd.get('CVSS', xforce_data['cvss']['version'])
 
             yield data
 

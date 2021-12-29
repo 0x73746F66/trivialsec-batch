@@ -1,16 +1,21 @@
 version: '3.9'
 services:
-  scheduler:
+  batch:
     env_file: .env
-    image: "registry.gitlab.com/trivialsec/scheduler/${BUILD_ENV}:${IMAGE_TAG:-latest}"
-    container_name: scheduler
+    image: "registry.gitlab.com/trivialsec/batch/${BUILD_ENV}:${IMAGE_TAG:-latest}"
+    container_name: batch
+    hostname: batch.trivialsec
     build:
       context: ./
       dockerfile: Dockerfile
       args:
         BUILD_ENV: ${BUILD_ENV}
+        TRIVIALSEC_PY_LIB_VER: ${TRIVIALSEC_PY_LIB_VER}
+        GITLAB_USER: ${GITLAB_USER}
+        GITLAB_PASSWORD: ${GITLAB_PAT}
+        CRONICLE_VERSION: ${CRONICLE_VERSION}
     environment:
-      - COMMON_VERSION=${COMMON_VERSION}
+      - TRIVIALSEC_PY_LIB_VER=${TRIVIALSEC_PY_LIB_VER}
       - APP_ENV=${APP_ENV:-Dev}
       - APP_NAME=${APP_NAME}
       - LOG_LEVEL=${LOG_LEVEL}
@@ -20,12 +25,9 @@ services:
     volumes:
       - ./src:/srv/app/src
       - cache:/var/cache/trivialsec
-    cap_drop:
-      - ALL
-    cap_add:
-      - DAC_OVERRIDE
-      - CAP_SETGID
-      - CAP_SETUID
+      - cronicle:/opt/cronicle
+    ports:
+      - "3012:3012"
     networks:
       default:
     logging:
@@ -35,15 +37,12 @@ services:
     deploy:
       restart_policy:
         condition: on-failure
-        delay: 0s
         max_attempts: 10
-        window: 3s
       resources:
         limits:
           cpus: '1.00'
           memory: 2GB
         reservations:
-          cpus: '0.50'
           memory: 1GB
 
 networks:
@@ -54,4 +53,7 @@ networks:
 volumes:
   cache:
     external: true
-    name: scheduler-cache
+    name: batch-cache
+  cronicle:
+    external: true
+    name: cronicle-datadir
