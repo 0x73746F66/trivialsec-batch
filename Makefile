@@ -66,9 +66,9 @@ setup: ## Creates docker networks and volumes
 	@echo $(shell docker --version)
 	@echo $(shell docker-compose --version)
 	@pip --version
-	pip install -q -U pip
-	pip install -q -U  setuptools wheel semgrep pylint
-	pip install -q -U -r requirements.txt
+	pip install --progress-bar off -U pip
+	pip install --progress-bar off -U  setuptools wheel semgrep pylint
+	pip install --progress-bar off -U -r requirements.txt
 	docker network create trivialsec 2>/dev/null || true
 	docker volume create --name=cronicle-datadir 2>/dev/null || true
 	docker volume create --name=batch-cache 2>/dev/null || true

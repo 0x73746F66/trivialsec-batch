@@ -21,6 +21,7 @@ if config.http_proxy or config.https_proxy:
         'http': f'http://{config.http_proxy}',
         'https': f'https://{config.https_proxy}'
     }
+GSD_BASE_URL = 'https://raw.githubusercontent.com/cloudsecurityalliance/gsd-database/main'
 USER_AGENT = 'trivialsec.com'
 BASE_URL = 'https://nvd.nist.gov'
 DATAFILE_DIR = '/var/cache/trivialsec'
@@ -129,7 +130,13 @@ def normalise_cve_item(item :dict) -> CVE:
             cwes.add(cwe_item.get('value'))
     cve.cwe = list(cwes)
     reference_urls = set()
-    cve.references = []
+    _, year, num_id = cve.cve_id.split('-')
+    cve.references = [{
+        'url': f"{GSD_BASE_URL}/{year}/{num_id[:-3]}xxx/GSD-{year}-{num_id}.json",
+        'name': f'GSD-{year}-{num_id}',
+        'source': 'cloudsecurityalliance/gsd-database',
+        'tags': [],
+    }]
     for reference in original_cve.references:
         if reference.get('url') not in reference_urls:
             reference_urls.add(reference.get('url'))

@@ -45,7 +45,7 @@ RUN echo "Preparing folders..." && \
 
 WORKDIR /srv/app
 USER trivialsec
-RUN python3 -m pip install -q -U --no-warn-script-location pip && \
+RUN python3 -m pip install --progress-bar off -U --no-warn-script-location pip && \
     echo "Cloning Python Libs Package from Gitlab" && \
     git clone -q -c advice.detachedHead=false --depth 1 --branch ${TRIVIALSEC_PY_LIB_VER} --single-branch https://${GITLAB_USER}:${GITLAB_PASSWORD}@gitlab.com/trivialsec/python-common.git /tmp/python-libs && \
     cd /tmp/python-libs && \
@@ -55,7 +55,7 @@ RUN python3 -m pip install -q -U --no-warn-script-location pip && \
 COPY --chown=trivialsec:trivialsec *.env .
 COPY --chown=trivialsec:trivialsec src src
 COPY --chown=trivialsec:trivialsec requirements.txt requirements.txt
-RUN pip install --user --no-warn-script-location -r requirements.txt
+RUN pip install --progress-bar off --user --no-warn-script-location -r requirements.txt
 
 USER root
 WORKDIR /opt/cronicle
